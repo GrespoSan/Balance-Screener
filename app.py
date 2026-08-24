@@ -64,6 +64,37 @@ def normalize_stock_ticker(ticker: str, market: str) -> str:
     return t
 
 
+def infer_market_from_text(text: str, source_name: str = "") -> str:
+    """Riconosce Italia/USA dai file ticker senza modificare la logica Balance."""
+    name = (source_name or "").upper()
+    if any(tag in name for tag in ("AZIONI_ITA", "ITALIA", "ITALY")):
+        return "Italia"
+    if any(tag in name for tag in ("STOCK USA", "AZIONI_USA", "_USA", " US ")):
+        return "USA"
+
+    raw_tokens = []
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+        if ";" in line or "\t" in line:
+            parts = [p.strip() for p in re.split(r"[;\t]", line) if p.strip()]
+            if parts:
+                raw_tokens.append(parts[-1].upper())
+        else:
+            raw_tokens.extend(t.strip().upper() for t in line.split(",") if t.strip())
+
+    if not raw_tokens:
+        return "USA"
+    mi_count = sum(t.endswith(".MI") or t.startswith("MIL:") for t in raw_tokens)
+    explicit_other_suffix = sum(bool(re.search(r"\.[A-Z]{1,4}$", t)) and not t.endswith(".MI") for t in raw_tokens)
+    if mi_count >= max(1, len(raw_tokens) // 2):
+        return "Italia"
+    if mi_count and explicit_other_suffix:
+        return "Misto / ticker Yahoo completi"
+    return "USA"
+
+
 def parse_tickers(text: str, market: str) -> list[tuple[str, str]]:
     """
     Formati accettati:
@@ -681,7 +712,12 @@ def excel_bytes(active: pd.DataFrame, all_zones: pd.DataFrame, errors: list[dict
 # =============================================================================
 with st.sidebar:
     st.header("Impostazioni")
-    market = st.selectbox("Mercato lista", ["Italia", "USA", "Misto / ticker Yahoo completi"], index=0)
+    market_choice = st.selectbox(
+        "Mercato lista",
+        ["Automatico", "Italia", "USA", "Misto / ticker Yahoo completi"],
+        index=0,
+        help="Automatico: riconosce i file italiani con ticker .MI e i file USA con ticker standard.",
+    )
     adjusted = st.checkbox(
         "Prezzi Yahoo adjusted",
         value=False,
@@ -694,11 +730,21 @@ with st.sidebar:
     )
     uploaded = st.file_uploader("File ticker .txt", type=["txt", "csv"])
     use_manual = st.checkbox("Modifica/incolla ticker manualmente", value=uploaded is None)
-    default_text = italy_example() if market == "Italia" else usa_example() if market == "USA" else "# Nome;Ticker Yahoo\n"
-    manual_text = st.text_area("Ticker", default_text, height=320, disabled=not use_manual)
+    if use_manual:
+        if market_choice == "Italia":
+            default_text = italy_example()
+        elif market_choice == "USA":
+            default_text = usa_example()
+        else:
+            default_text = "# Ticker oppure Nome;Ticker Yahoo\n"
+        manual_text = st.text_area("Ticker", default_text, height=320)
+    else:
+        manual_text = ""
     run = st.button("🔎 Cerca aree Balance attive", type="primary", use_container_width=True)
 
+source_name = ""
 if uploaded is not None and not use_manual:
+    source_name = getattr(uploaded, "name", "")
     try:
         text = uploaded.getvalue().decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -706,10 +752,13 @@ if uploaded is not None and not use_manual:
 else:
     text = manual_text
 
+market = infer_market_from_text(text, source_name) if market_choice == "Automatico" else market_choice
 universe = parse_tickers(text, market)
 
 with st.sidebar:
     if text.strip():
+        if market_choice == "Automatico":
+            st.caption(f"Mercato rilevato: **{market}**")
         st.caption(f"Ticker riconosciuti: **{len(universe)}**")
         if universe:
             preview = ", ".join(t for _, t in universe[:8])
