@@ -18,8 +18,8 @@ import yfinance as yf
 # =============================================================================
 # PAGE
 # =============================================================================
-st.set_page_config(page_title="G. Balance Stock Active V2.2", page_icon="🎯", layout="wide")
-st.title("🎯 G. Balance Stock Active V2.2 — Daily chiusa")
+st.set_page_config(page_title="G. Balance Stock screener", page_icon="🎯", layout="wide")
+st.title("🎯 G. Balance Stock screener")
 
 LOOKBACK = 500
 LAST_TOUCH_BARS = 3
@@ -689,7 +689,7 @@ with st.sidebar:
     )
     require_last_close_inside = st.checkbox(
         "Richiedi ultimo Close Daily dentro la Balance",
-        value=True,
+        value=False,
         help="ON: oltre ad almeno 2 tocchi reali nelle ultime 3 Daily chiuse, l'ultimo Close deve essere dentro la stessa fascia. OFF: bastano i 2 tocchi reali su 3.",
     )
     uploaded = st.file_uploader("File ticker .txt", type=["txt", "csv"])
