@@ -1,0 +1,13 @@
+# LABEL;TICKER Yahoo Finance
+ES;ES=F
+NQ;NQ=F
+YM;YM=F
+RTY;RTY=F
+Gold;GC=F
+Silver;SI=F
+Copper;HG=F
+WTI;CL=F
+NatGas;NG=F
+Euro FX;6E=F
+British Pound;6B=F
+Japanese Yen;6J=F

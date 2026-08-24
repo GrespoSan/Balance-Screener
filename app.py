@@ -17,13 +17,8 @@ import yfinance as yf
 # =============================================================================
 # PAGE
 # =============================================================================
-st.set_page_config(page_title="G. Balance Reversal Screener V1", page_icon="⚖️", layout="wide")
-st.title("⚖️ G. Balance Reversal Screener V1")
-st.caption(
-    "Screener indipendente dal COT. Cerca test, reazioni e attraversamenti delle Balance su Daily, H4 e H1. "
-    "Il motore Balance deriva dal COT Smart Money V6.49/V6.50; H4 viene ricostruito da dati H1."
-)
-
+st.set_page_config(page_title="G. Balance Opportunity Screener V2", page_icon="⚖️", layout="wide")
+st.title("⚖️ G. Balance Opportunity Screener V2")
 
 # =============================================================================
 # MODELS
@@ -493,155 +488,383 @@ def balance_role(z: BalanceZone, ref_close: float) -> str:
 
 
 # =============================================================================
-# SCREENER LOGIC
+# SCREENER LOGIC — V2: opportunità in formazione sulle Balance
 # =============================================================================
-def _nearest_zone(balance: dict[str, Any]) -> BalanceZone | None:
-    zones: list[BalanceZone] = list(balance.get("zones", []))
-    if not zones:
+def _zone_historical_role(z: BalanceZone) -> tuple[str, float]:
+    """Historical bias of the zone. Used as context, never as a hard filter."""
+    sup = float(z.support_hits) + 2.0 * float(z.independent_support_success)
+    res = float(z.resistance_hits) + 2.0 * float(z.independent_resistance_success)
+    total = sup + res
+    if total <= 0:
+        return "MISTA", 50.0
+    sup_share = 100.0 * sup / total
+    res_share = 100.0 * res / total
+    if sup >= 2 and sup >= res * 1.25:
+        return "SUPPORTO", sup_share
+    if res >= 2 and res >= sup * 1.25:
+        return "RESISTENZA", res_share
+    return "MISTA", max(sup_share, res_share)
+
+
+def _overlaps_zone(row: pd.Series, z: BalanceZone) -> bool:
+    return float(row["low"]) <= z.center + z.half and float(row["high"]) >= z.center - z.half
+
+
+def _distance_to_zone_atr(close: float, z: BalanceZone, atr: float) -> float:
+    if not math.isfinite(atr) or atr <= 0:
+        return math.nan
+    bottom, top = z.center - z.half, z.center + z.half
+    if bottom <= close <= top:
+        return 0.0
+    if close > top:
+        return (close - top) / atr
+    return (bottom - close) / atr
+
+
+def _recent_touch_episode(data: pd.DataFrame, z: BalanceZone, max_age: int = 14, allowed_gap: int = 1) -> dict[str, int] | None:
+    current = len(data) - 1
+    start_scan = max(0, current - max_age)
+    touch_positions = [p for p in range(start_scan, current + 1) if _overlaps_zone(data.iloc[p], z)]
+    if not touch_positions:
         return None
-    ref = float(balance.get("close", math.nan))
-    origin = float(balance.get("origin", math.nan))
-    if math.isfinite(origin):
-        return min(zones, key=lambda z: abs(z.center - origin))
-    return min(zones, key=lambda z: abs(z.center - ref))
-
-
-def setup_label(state: int) -> str:
+    latest = touch_positions[-1]
+    start = latest
+    gap = 0
+    for p in range(latest - 1, start_scan - 1, -1):
+        if _overlaps_zone(data.iloc[p], z):
+            start = p
+            gap = 0
+        else:
+            gap += 1
+            if gap > allowed_gap:
+                break
+    touches = sum(1 for p in range(start, current + 1) if _overlaps_zone(data.iloc[p], z))
     return {
-        5: "RECUPERO COMPLETO LONG",
-        4: "TEST BALANCE SUPERIORE",
-        3: "RECUPERO LONG",
-        2: "REAZIONE LONG",
-        1: "TEST BALANCE",
-        0: "NESSUN SETUP",
-        -2: "REAZIONE SHORT",
-        -3: "PERDITA SHORT",
-        -4: "TEST BALANCE INFERIORE",
-        -5: "PERDITA COMPLETA SHORT",
-    }.get(state, "NESSUN SETUP")
-
-
-def priority_score(balance: dict[str, Any]) -> tuple[float, dict[str, float]]:
-    """Priority ranking only; NOT a probability or backtested expectancy."""
-    state = int(balance.get("state", 0))
-    event_map = {2: 100, -2: 100, 1: 85, 3: 75, -3: 75, 4: 65, -4: 65, 5: 55, -5: 55, 0: 0}
-    event = float(event_map.get(state, 0))
-    z = _nearest_zone(balance)
-    if z is None:
-        return 0.0, {"event": event, "strength": 0.0, "reliability": 0.0, "freshness": 0.0, "proximity": 0.0}
-    strength = float(z.strength)
-    reliability = float(z.reliability) if not pd.isna(z.reliability) else 0.0
-    age = float(balance.get("origin_touch_age", math.nan))
-    if not math.isfinite(age):
-        age = float(z.last_hit_age) if z.last_hit_age < 99999 else 60.0
-    freshness = 100.0 * math.exp(-max(0.0, age) / 8.0)
-    atr = float(balance.get("atr14", math.nan))
-    close = float(balance.get("close", math.nan))
-    dist_atr = abs(close - z.center) / atr if math.isfinite(atr) and atr > 0 else 10.0
-    proximity = max(0.0, 100.0 * (1.0 - min(dist_atr, 2.0) / 2.0))
-    score = 0.50 * event + 0.20 * strength + 0.15 * reliability + 0.10 * freshness + 0.05 * proximity
-    return round(max(0.0, min(100.0, score)), 1), {
-        "event": event, "strength": round(strength, 1), "reliability": round(reliability, 1),
-        "freshness": round(freshness, 1), "proximity": round(proximity, 1),
+        "first": start,
+        "latest": latest,
+        "bars_from_first": current - start,
+        "bars_since_last": current - latest,
+        "touch_bars": touches,
     }
 
 
-def result_row(label: str, ticker: str, timeframe: str, data: pd.DataFrame, balance: dict[str, Any], data_note: str) -> dict[str, Any]:
-    state = int(balance.get("state", 0))
-    zone = _nearest_zone(balance)
+def _arrival_direction(data: pd.DataFrame, z: BalanceZone, atr: float, first_touch: int | None = None) -> tuple[str, float]:
+    """Direction into the Balance using price only. LONG means price arrived from above/downward."""
+    current = len(data) - 1
+    anchor = current if first_touch is None else first_touch
+    ref = max(0, anchor - 6)
+    if anchor <= ref or not math.isfinite(atr) or atr <= 0:
+        return "NESSUNA", 0.0
+    pre_close = float(data.iloc[ref]["close"])
+    anchor_close = float(data.iloc[anchor]["close"])
+    top, bottom = z.center + z.half, z.center - z.half
+    move_atr = (anchor_close - pre_close) / atr
+
+    long_score = max(0.0, (pre_close - top) / atr) + max(0.0, -move_atr)
+    short_score = max(0.0, (bottom - pre_close) / atr) + max(0.0, move_atr)
+
+    if long_score >= max(0.25, short_score * 1.15):
+        return "LONG", abs(move_atr)
+    if short_score >= max(0.25, long_score * 1.15):
+        return "SHORT", abs(move_atr)
+    return "NESSUNA", abs(move_atr)
+
+
+def _role_alignment_score(z: BalanceZone, direction: str) -> tuple[str, float]:
+    role, dominance = _zone_historical_role(z)
+    if role == "MISTA":
+        return role, 60.0
+    aligned = (direction == "LONG" and role == "SUPPORTO") or (direction == "SHORT" and role == "RESISTENZA")
+    return role, min(100.0, dominance) if aligned else 35.0
+
+
+def analyze_zone_opportunity(
+    data: pd.DataFrame,
+    balance: dict[str, Any],
+    z: BalanceZone,
+    approach_max_atr: float = 0.45,
+    already_moved_atr: float = 1.00,
+) -> dict[str, Any]:
+    atr = float(balance.get("atr14", math.nan))
+    close = float(balance.get("close", math.nan))
+    current = len(data) - 1
+    bottom, top = z.center - z.half, z.center + z.half
+    dist_zone = _distance_to_zone_atr(close, z, atr)
+    episode = _recent_touch_episode(data, z)
+
+    if episode is None:
+        direction, arrival_atr = _arrival_direction(data, z, atr, None)
+        moving_toward = (
+            direction == "LONG" and close > top
+        ) or (
+            direction == "SHORT" and close < bottom
+        )
+        if direction == "NESSUNA" or not moving_toward or not math.isfinite(dist_zone) or dist_zone > approach_max_atr:
+            return {"active": False, "phase": "NESSUNA", "direction": "", "score": 0.0}
+        phase = "IN AVVICINAMENTO"
+        bars_from_first = math.nan
+        bars_since_last = math.nan
+        touch_bars = 0
+        move_from_zone_atr = 0.0
+        local_confirm = False
+    else:
+        direction, arrival_atr = _arrival_direction(data, z, atr, episode["first"])
+        if direction == "NESSUNA":
+            # Fallback: position before the current touch episode tells us from which side price arrived.
+            pre_idx = max(0, episode["first"] - 4)
+            pre_close = float(data.iloc[pre_idx]["close"])
+            if pre_close > top:
+                direction = "LONG"
+            elif pre_close < bottom:
+                direction = "SHORT"
+        if direction == "NESSUNA":
+            return {"active": False, "phase": "NESSUNA", "direction": "", "score": 0.0}
+
+        bars_from_first = episode["bars_from_first"]
+        bars_since_last = episode["bars_since_last"]
+        touch_bars = episode["touch_bars"]
+        current_overlap = _overlaps_zone(data.iloc[current], z)
+        current_away = max(0.0, (close - top) / atr) if direction == "LONG" else max(0.0, (bottom - close) / atr)
+        move_from_zone_atr = current_away
+
+        if direction == "LONG" and close < bottom - 0.20 * atr:
+            return {"active": False, "phase": "INVALIDATA", "direction": direction, "score": 0.0}
+        if direction == "SHORT" and close > top + 0.20 * atr:
+            return {"active": False, "phase": "INVALIDATA", "direction": direction, "score": 0.0}
+
+        prior_slice = data.iloc[max(episode["first"], current - 3):current]
+        if direction == "LONG":
+            prior_level = float(prior_slice["high"].max()) if not prior_slice.empty else math.inf
+            local_confirm = close > prior_level
+            two_closes = current >= 1 and close > top and float(data.iloc[current - 1]["close"]) > top
+        else:
+            prior_level = float(prior_slice["low"].min()) if not prior_slice.empty else -math.inf
+            local_confirm = close < prior_level
+            two_closes = current >= 1 and close < bottom and float(data.iloc[current - 1]["close"]) < bottom
+
+        if current_away > already_moved_atr:
+            phase = "GIÀ PARTITA"
+        elif current_overlap or (math.isfinite(dist_zone) and dist_zone <= 0.08):
+            phase = "IN TEST"
+        elif current_away > 0:
+            if local_confirm or (two_closes and current_away >= 0.10):
+                phase = "CONFERMATA"
+            else:
+                phase = "REAZIONE"
+        else:
+            phase = "IN TEST"
+
+    role, role_score = _role_alignment_score(z, direction)
+    reliability = float(z.reliability) if not pd.isna(z.reliability) else 50.0
+    strength = float(z.strength)
+    stage_base = {
+        "CONFERMATA": 100.0,
+        "REAZIONE": 94.0,
+        "IN TEST": 90.0,
+        "IN AVVICINAMENTO": 78.0,
+        "GIÀ PARTITA": 35.0,
+    }.get(phase, 0.0)
+    freshness = 100.0 if episode is None else 100.0 * math.exp(-float(bars_since_last) / 5.0)
+    arrival_score = min(100.0, 100.0 * float(arrival_atr) / 1.5)
+    score = (
+        0.40 * stage_base
+        + 0.20 * strength
+        + 0.15 * reliability
+        + 0.10 * arrival_score
+        + 0.10 * freshness
+        + 0.05 * role_score
+    )
+    score = round(max(0.0, min(100.0, score)), 1)
+
+    signal = {
+        ("LONG", "IN AVVICINAMENTO"): "WATCH LONG",
+        ("LONG", "IN TEST"): "WATCH LONG",
+        ("LONG", "REAZIONE"): "REAZIONE LONG",
+        ("LONG", "CONFERMATA"): "TRIGGER LONG",
+        ("LONG", "GIÀ PARTITA"): "GIÀ PARTITA LONG",
+        ("SHORT", "IN AVVICINAMENTO"): "WATCH SHORT",
+        ("SHORT", "IN TEST"): "WATCH SHORT",
+        ("SHORT", "REAZIONE"): "REAZIONE SHORT",
+        ("SHORT", "CONFERMATA"): "TRIGGER SHORT",
+        ("SHORT", "GIÀ PARTITA"): "GIÀ PARTITA SHORT",
+    }.get((direction, phase), "NESSUNA OCCASIONE")
+
+    return {
+        "active": phase in {"IN AVVICINAMENTO", "IN TEST", "REAZIONE", "CONFERMATA"},
+        "phase": phase,
+        "direction": direction,
+        "signal": signal,
+        "score": score,
+        "zone": z,
+        "historical_role": role,
+        "distance_zone_atr": dist_zone,
+        "arrival_atr": float(arrival_atr),
+        "bars_from_first": bars_from_first,
+        "bars_since_last": bars_since_last,
+        "touch_bars": touch_bars,
+        "move_from_zone_atr": move_from_zone_atr,
+        "local_confirm": bool(local_confirm),
+    }
+
+
+def select_opportunity(data: pd.DataFrame, balance: dict[str, Any]) -> dict[str, Any]:
+    zones: list[BalanceZone] = list(balance.get("zones", []))
+    candidates: list[dict[str, Any]] = []
+    for z in zones:
+        candidate = analyze_zone_opportunity(data, balance, z)
+        if candidate.get("phase") not in {"NESSUNA", "INVALIDATA"}:
+            candidates.append(candidate)
+    if candidates:
+        phase_rank = {"CONFERMATA": 5, "REAZIONE": 4, "IN TEST": 3, "IN AVVICINAMENTO": 2, "GIÀ PARTITA": 1}
+        return max(candidates, key=lambda x: (phase_rank.get(str(x.get("phase")), 0), float(x.get("score", 0.0))))
+
+    # No setup: retain the nearest zone so the full-market sheet remains informative.
     close = float(balance.get("close", math.nan))
     atr = float(balance.get("atr14", math.nan))
-    score, parts = priority_score(balance)
-    if zone is not None:
-        dist_atr = abs(close - zone.center) / atr if math.isfinite(atr) and atr > 0 else math.nan
-        role = balance_role(zone, close)
-        zone_center = zone.center
-        zone_low = zone.center - zone.half
-        zone_high = zone.center + zone.half
-        strength = zone.strength
-        reliability = zone.reliability
-        tests = zone.independent_tests
-    else:
-        dist_atr = zone_center = zone_low = zone_high = strength = reliability = math.nan
+    if zones:
+        z = min(zones, key=lambda q: _distance_to_zone_atr(close, q, atr))
+        role, _ = _zone_historical_role(z)
+        return {
+            "active": False, "phase": "NESSUNA", "direction": "", "signal": "NESSUNA OCCASIONE", "score": 0.0,
+            "zone": z, "historical_role": role, "distance_zone_atr": _distance_to_zone_atr(close, z, atr),
+            "arrival_atr": math.nan, "bars_from_first": math.nan, "bars_since_last": math.nan,
+            "touch_bars": 0, "move_from_zone_atr": math.nan, "local_confirm": False,
+        }
+    return {"active": False, "phase": "NESSUNA", "direction": "", "signal": "NESSUNA OCCASIONE", "score": 0.0}
+
+
+def result_row(label: str, ticker: str, timeframe: str, data: pd.DataFrame, balance: dict[str, Any], data_note: str) -> dict[str, Any]:
+    opp = select_opportunity(data, balance)
+    z: BalanceZone | None = opp.get("zone")
+    close = float(balance.get("close", math.nan))
+    if z is None:
+        zone_center = zone_low = zone_high = strength = reliability = math.nan
         tests = 0
         role = "N/D"
+    else:
+        zone_center = z.center
+        zone_low = z.center - z.half
+        zone_high = z.center + z.half
+        strength = z.strength
+        reliability = z.reliability
+        tests = z.independent_tests
+        role = str(opp.get("historical_role", "MISTA"))
+
+    arrival_text = "RIBASSISTA" if opp.get("direction") == "LONG" else "RIALZISTA" if opp.get("direction") == "SHORT" else "—"
     return {
         "Strumento": label,
         "Ticker": ticker,
         "TF": timeframe,
-        "Setup": setup_label(state),
-        "State": state,
-        "Score priorità": score,
+        "Segnale": opp.get("signal", "NESSUNA OCCASIONE"),
+        "Fase": opp.get("phase", "NESSUNA"),
+        "Direzione": opp.get("direction", ""),
+        "Score priorità": float(opp.get("score", 0.0)),
         "Prezzo": close,
         "Balance": zone_center,
         "Zona min": zone_low,
         "Zona max": zone_high,
-        "Ruolo": role,
-        "Distanza ATR": dist_atr,
+        "Ruolo storico": role,
+        "Distanza zona ATR": opp.get("distance_zone_atr", math.nan),
+        "Arrivo": arrival_text,
+        "Forza arrivo ATR": opp.get("arrival_atr", math.nan),
+        "Barre dal primo test": opp.get("bars_from_first", math.nan),
+        "Barre in zona": opp.get("touch_bars", 0),
+        "Ultimo test barre fa": opp.get("bars_since_last", math.nan),
+        "Movimento dalla zona ATR": opp.get("move_from_zone_atr", math.nan),
+        "Conferma locale": "SI" if opp.get("local_confirm") else "NO",
         "Strength": strength,
         "Reliability %": reliability,
         "Test indipendenti": tests,
-        "Balance origine": balance.get("origin", math.nan),
-        "Balance successiva": balance.get("next_zone", math.nan),
-        "Percorso": balance.get("path_direction", ""),
         "Barra riferimento": balance.get("reference_date", ""),
         "Nota dati": data_note,
-        "_score_event": parts["event"],
-        "_score_strength": parts["strength"],
-        "_score_reliability": parts["reliability"],
-        "_score_freshness": parts["freshness"],
-        "_score_proximity": parts["proximity"],
+        "_active": bool(opp.get("active", False)),
     }
 
 
-def plot_balance(data: pd.DataFrame, balance: dict[str, Any], ticker: str, timeframe: str) -> go.Figure:
+def plot_balance(data: pd.DataFrame, balance: dict[str, Any], ticker: str, timeframe: str, row: pd.Series | None = None) -> go.Figure:
     bars = 180 if timeframe == "Daily" else 260
     chart = data.tail(bars)
     fig = go.Figure(data=[go.Candlestick(
         x=chart.index, open=chart["open"], high=chart["high"], low=chart["low"], close=chart["close"], name=ticker
     )])
-    ref_close = float(balance.get("close", math.nan))
-    origin = float(balance.get("origin", math.nan))
-    next_zone = float(balance.get("next_zone", math.nan))
+    selected_balance = float(row.get("Balance", math.nan)) if row is not None else math.nan
     for z in balance.get("zones", []):
-        role = balance_role(z, ref_close)
+        role, _ = _zone_historical_role(z)
         annotation = f"{role} {z.center:.4f}"
-        if math.isfinite(origin) and abs(z.center - origin) <= max(1e-12, z.half):
-            annotation += " · ORIGINE"
-        if math.isfinite(next_zone) and abs(z.center - next_zone) <= max(1e-12, z.half):
-            annotation += " · SUCCESSIVA"
-        fig.add_hrect(y0=z.center-z.half, y1=z.center+z.half, opacity=0.10, line_width=0,
+        opacity = 0.20 if math.isfinite(selected_balance) and abs(z.center - selected_balance) <= max(1e-12, z.half) else 0.08
+        if opacity > 0.10:
+            annotation += " · SETUP"
+        fig.add_hrect(y0=z.center-z.half, y1=z.center+z.half, opacity=opacity, line_width=0,
                       annotation_text=annotation, annotation_position="top right")
         fig.add_hline(y=z.center, line_dash="dot", line_width=1)
+    title_suffix = ""
+    if row is not None:
+        title_suffix = f" · {row.get('Segnale', '')} · {row.get('Fase', '')}"
     fig.update_layout(
-        title=f"{ticker} · {timeframe} · {balance.get('state_text', '')}", height=620,
+        title=f"{ticker} · {timeframe}{title_suffix}", height=620,
         margin=dict(l=20, r=20, t=60, b=20), xaxis_rangeslider_visible=False,
     )
     return fig
+
+
+def _excel_bytes(opportunities: pd.DataFrame, full: pd.DataFrame, errors: list[dict[str, str]]) -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+        opportunities.to_excel(writer, sheet_name="Opportunità", index=False)
+        full.to_excel(writer, sheet_name="Tutti i mercati", index=False)
+        if errors:
+            pd.DataFrame(errors).to_excel(writer, sheet_name="Errori", index=False)
+
+        workbook = writer.book
+        header_fmt = workbook.add_format({"bold": True, "bg_color": "#1F4E78", "font_color": "#FFFFFF", "border": 1, "align": "center", "valign": "vcenter"})
+        long_fmt = workbook.add_format({"bg_color": "#E2F0D9"})
+        short_fmt = workbook.add_format({"bg_color": "#FCE4D6"})
+        test_fmt = workbook.add_format({"bg_color": "#FFF2CC"})
+        num4_fmt = workbook.add_format({"num_format": "0.0000"})
+        num2_fmt = workbook.add_format({"num_format": "0.00"})
+
+        for sheet_name, df in [("Opportunità", opportunities), ("Tutti i mercati", full)]:
+            ws = writer.sheets[sheet_name]
+            ws.freeze_panes(1, 0)
+            ws.autofilter(0, 0, max(0, len(df)), max(0, len(df.columns) - 1))
+            ws.set_row(0, 24, header_fmt)
+            for col_idx, col in enumerate(df.columns):
+                width = min(34, max(11, len(str(col)) + 2))
+                if col in {"Segnale", "Fase", "Strumento", "Ticker", "Ruolo storico"}:
+                    width = max(width, 17)
+                fmt = None
+                if col in {"Prezzo", "Balance", "Zona min", "Zona max"}:
+                    fmt = num4_fmt
+                elif "ATR" in col or col in {"Score priorità", "Strength", "Reliability %"}:
+                    fmt = num2_fmt
+                ws.set_column(col_idx, col_idx, width, fmt)
+            if len(df) > 0 and "Direzione" in df.columns:
+                dcol = df.columns.get_loc("Direzione")
+                fcol = df.columns.get_loc("Fase") if "Fase" in df.columns else dcol
+                ws.conditional_format(1, 0, len(df), len(df.columns)-1, {"type": "formula", "criteria": f'=${chr(65+dcol)}2="LONG"', "format": long_fmt}) if dcol < 26 else None
+                ws.conditional_format(1, 0, len(df), len(df.columns)-1, {"type": "formula", "criteria": f'=${chr(65+dcol)}2="SHORT"', "format": short_fmt}) if dcol < 26 else None
+                ws.conditional_format(1, 0, len(df), len(df.columns)-1, {"type": "formula", "criteria": f'=${chr(65+fcol)}2="IN TEST"', "format": test_fmt}) if fcol < 26 else None
+    return out.getvalue()
 
 
 # =============================================================================
 # UI
 # =============================================================================
 def default_universe() -> str:
-    return """# Un ticker Yahoo Finance per riga\nES;ES=F\nNQ;NQ=F\nYM;YM=F\nRTY;RTY=F\nGold;GC=F\nSilver;SI=F\nCopper;HG=F\nWTI;CL=F\nNatGas;NG=F\nEURUSD;EURUSD=X\nGBPUSD;GBPUSD=X\nUSDJPY;JPY=X\n"""
+    return """# LABEL;TICKER Yahoo Finance\nES;ES=F\nNQ;NQ=F\nYM;YM=F\nRTY;RTY=F\nGold;GC=F\nSilver;SI=F\nCopper;HG=F\nWTI;CL=F\nNatGas;NG=F\nEuro FX;6E=F\nBritish Pound;6B=F\nJapanese Yen;6J=F\n"""
+
 
 with st.sidebar:
     st.header("Impostazioni")
     timeframe = st.selectbox("Timeframe", ["Daily", "H4", "H1"], index=0)
     lookback = st.number_input("Lookback Balance (barre)", min_value=120, max_value=1000, value=500, step=50)
-    show_only_active = st.checkbox("Mostra solo setup attivi", value=True)
+    view_mode = st.selectbox("Visualizza", ["Solo opportunità", "Opportunità + già partite", "Tutti i mercati"], index=0)
     min_score = st.slider("Score priorità minimo", 0, 100, 45, 1)
     st.divider()
     uploaded = st.file_uploader("File ticker .txt", type=["txt", "csv"])
     use_manual = st.checkbox("Modifica/incolla ticker manualmente", value=uploaded is None)
     manual_text = st.text_area("Ticker", default_universe(), height=260, disabled=not use_manual)
     run = st.button("🔎 Avvia screener", type="primary", use_container_width=True)
-
-st.info(
-    "V1 metodologica: nessun COT, EMA, RSI o altro filtro. Lo Score serve solo a ordinare i casi più interessanti; "
-    "non rappresenta una probabilità di successo. H4 è ricostruito da H1 e può non coincidere perfettamente con le barre H4 di TradingView."
-)
 
 if uploaded is not None and not use_manual:
     try:
@@ -664,7 +887,7 @@ if run:
     bar = st.progress(0.0, text="Avvio screener…")
 
     for i, (label, ticker) in enumerate(universe, start=1):
-        bar.progress((i - 1) / len(universe), text=f"{ticker} · download e analisi Balance")
+        bar.progress((i - 1) / len(universe), text=f"{ticker} · analisi Balance")
         data, note = load_price_data(ticker, timeframe)
         if data.empty or len(data) < 60:
             errors.append({"Ticker": ticker, "Errore": note if note else "Dati insufficienti"})
@@ -681,11 +904,11 @@ if run:
             errors.append({"Ticker": ticker, "Errore": f"{type(exc).__name__}: {exc}"})
 
     bar.progress(1.0, text="Analisi completata")
-    st.session_state["balance_scan"] = {
+    st.session_state["balance_scan_v2"] = {
         "rows": rows, "details": details, "errors": errors, "timeframe": timeframe, "lookback": int(lookback)
     }
 
-payload = st.session_state.get("balance_scan")
+payload = st.session_state.get("balance_scan_v2")
 
 if payload:
     rows = payload["rows"]
@@ -699,76 +922,77 @@ if payload:
             st.dataframe(pd.DataFrame(errors), hide_index=True, use_container_width=True)
         st.stop()
 
-    full = pd.DataFrame(rows).sort_values(["Score priorità", "Distanza ATR"], ascending=[False, True]).reset_index(drop=True)
-    filtered = full.copy()
-    if show_only_active:
-        filtered = filtered[filtered["State"] != 0]
-    filtered = filtered[filtered["Score priorità"] >= min_score].reset_index(drop=True)
+    full = pd.DataFrame(rows).sort_values(["Score priorità", "Distanza zona ATR"], ascending=[False, True], na_position="last").reset_index(drop=True)
+    opportunities = full[full["_active"]].copy().reset_index(drop=True)
+    started = full[full["Fase"] == "GIÀ PARTITA"].copy().reset_index(drop=True)
+
+    if view_mode == "Solo opportunità":
+        filtered = opportunities.copy()
+    elif view_mode == "Opportunità + già partite":
+        filtered = pd.concat([opportunities, started], ignore_index=True)
+    else:
+        filtered = full.copy()
+
+    filtered = filtered[filtered["Score priorità"] >= min_score].copy().reset_index(drop=True)
     filtered.insert(0, "Rank", range(1, len(filtered) + 1))
 
     if scan_timeframe != timeframe:
         st.warning(f"I risultati visualizzati sono del timeframe {scan_timeframe}. Premi ‘Avvia screener’ per ricalcolare {timeframe}.")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Strumenti analizzati", len(rows))
-    c2.metric("Setup attivi", int((full["State"] != 0).sum()))
-    c3.metric("Reazioni", int(full["State"].isin([2, -2]).sum()))
-    c4.metric("In test", int((full["State"] == 1).sum()))
+    c1.metric("Strumenti analizzati", len(full))
+    c2.metric("Opportunità", len(opportunities))
+    c3.metric("In test", int((full["Fase"] == "IN TEST").sum()))
+    c4.metric("Trigger", int((full["Fase"] == "CONFERMATA").sum()))
 
-    st.subheader("Classifica attuale")
+    st.subheader("Opportunità Balance")
     visible_cols = [
-        "Rank", "Strumento", "Ticker", "TF", "Setup", "State", "Score priorità", "Prezzo", "Balance",
-        "Ruolo", "Distanza ATR", "Strength", "Reliability %", "Test indipendenti", "Balance origine",
-        "Balance successiva", "Percorso", "Barra riferimento",
+        "Rank", "Strumento", "Ticker", "TF", "Segnale", "Fase", "Score priorità", "Prezzo", "Balance",
+        "Zona min", "Zona max", "Distanza zona ATR", "Arrivo", "Forza arrivo ATR", "Barre dal primo test",
+        "Barre in zona", "Ultimo test barre fa", "Movimento dalla zona ATR", "Conferma locale",
+        "Ruolo storico", "Strength", "Reliability %", "Test indipendenti", "Barra riferimento",
     ]
     st.dataframe(
         filtered[visible_cols], hide_index=True, use_container_width=True,
         column_config={
             "Score priorità": st.column_config.ProgressColumn("Score priorità", min_value=0, max_value=100, format="%.1f"),
-            "Distanza ATR": st.column_config.NumberColumn("Dist. ATR", format="%.2f"),
+            "Distanza zona ATR": st.column_config.NumberColumn("Dist. zona ATR", format="%.2f"),
+            "Forza arrivo ATR": st.column_config.NumberColumn("Forza arrivo ATR", format="%.2f"),
+            "Movimento dalla zona ATR": st.column_config.NumberColumn("Mov. zona ATR", format="%.2f"),
             "Strength": st.column_config.NumberColumn("Strength", format="%.1f"),
             "Reliability %": st.column_config.NumberColumn("Reliability %", format="%.1f"),
             "Prezzo": st.column_config.NumberColumn("Prezzo", format="%.4f"),
             "Balance": st.column_config.NumberColumn("Balance", format="%.4f"),
-            "Balance origine": st.column_config.NumberColumn("Balance origine", format="%.4f"),
-            "Balance successiva": st.column_config.NumberColumn("Balance successiva", format="%.4f"),
+            "Zona min": st.column_config.NumberColumn("Zona min", format="%.4f"),
+            "Zona max": st.column_config.NumberColumn("Zona max", format="%.4f"),
         },
     )
 
-    csv = filtered[visible_cols].to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ Esporta CSV", csv, file_name=f"balance_screener_{scan_timeframe}.csv", mime="text/csv")
+    export_cols = [c for c in visible_cols if c != "Rank"] + ["Nota dati"]
+    opp_export = opportunities[export_cols].copy()
+    full_export = full[export_cols].copy()
+    xlsx = _excel_bytes(opp_export, full_export, errors)
+    st.download_button(
+        "⬇️ Esporta Excel",
+        data=xlsx,
+        file_name=f"balance_opportunity_screener_{scan_timeframe}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     if not filtered.empty:
         st.subheader("Verifica grafica")
-        selected_ticker = st.selectbox("Strumento da visualizzare", filtered["Ticker"].tolist(), key="balance_chart_ticker")
+        selected_ticker = st.selectbox("Strumento da visualizzare", filtered["Ticker"].tolist(), key="balance_chart_ticker_v2")
         data, balance, label = details[selected_ticker]
-        st.plotly_chart(plot_balance(data, balance, selected_ticker, scan_timeframe), use_container_width=True)
+        selected_row = filtered[filtered["Ticker"] == selected_ticker].iloc[0]
+        st.plotly_chart(plot_balance(data, balance, selected_ticker, scan_timeframe, selected_row), use_container_width=True)
 
-        z = _nearest_zone(balance)
-        if z is not None:
-            score, parts = priority_score(balance)
-            a, b, c, d = st.columns(4)
-            a.metric("State", f"{int(balance['state']):+d}" if int(balance['state']) else "0")
-            b.metric("Score priorità", f"{score:.1f}")
-            c.metric("Strength zona", f"{z.strength:.1f}")
-            d.metric("Reliability", "—" if pd.isna(z.reliability) else f"{z.reliability:.1f}%")
-            with st.expander("Composizione Score priorità"):
-                st.write(parts)
-                st.caption("Ranking euristico della V1: non è una probabilità e non è ancora un risultato di backtest.")
+        a, b, c, d, e = st.columns(5)
+        a.metric("Segnale", str(selected_row["Segnale"]))
+        b.metric("Fase", str(selected_row["Fase"]))
+        c.metric("Score", f"{float(selected_row['Score priorità']):.1f}")
+        d.metric("Dist. zona", "—" if pd.isna(selected_row["Distanza zona ATR"]) else f"{float(selected_row['Distanza zona ATR']):.2f} ATR")
+        e.metric("Barre in zona", int(selected_row["Barre in zona"]) if not pd.isna(selected_row["Barre in zona"]) else 0)
 
     if errors:
         with st.expander(f"Ticker senza risultato ({len(errors)})"):
             st.dataframe(pd.DataFrame(errors), hide_index=True, use_container_width=True)
-
-else:
-    st.subheader("Obiettivo della V1")
-    st.markdown(
-        """
-- **TEST BALANCE**: prezzo dentro una zona; nessuna direzione ancora confermata.
-- **REAZIONE LONG / SHORT**: il prezzo ha toccato una Balance e si è allontanato nella direzione opposta.
-- **RECUPERO / PERDITA**: attraversamento confermato della fascia.
-- **PROGRESSIONE**: movimento dalla Balance di origine verso la Balance successiva.
-
-La priorità iniziale è trovare **reazioni fresche** e **test in corso**. Prima di aggiungere filtri esterni va verificato, con replay/backtest, se questi eventi hanno follow-through sufficiente.
-        """
-    )
