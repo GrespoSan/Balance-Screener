@@ -23,8 +23,8 @@ st.set_page_config(page_title="G. Balance Stock screener", page_icon="🎯", lay
 st.title("🎯 G. Balance Stock screener")
 
 LOOKBACK = 500
-LAST_TOUCH_BARS = 5
-DEFAULT_MIN_TOUCHES = 2
+INTERACTION_WINDOW = 3
+MIN_INTERACTION_BARS = 2
 
 
 # =============================================================================
@@ -560,7 +560,9 @@ def analyze_balance_zones(
 
 
 # =============================================================================
-# ACTIVE AREA — nessuna tolleranza aggiuntiva
+# ACTIVE AREA — porting diretto G. Balance Active Area Screener V4.4
+# Adattamento richiesto: SOLO Daily chiuse.
+# Quindi "barra 0" = ultima Daily completamente chiusa.
 # =============================================================================
 def candle_touches_zone(row: pd.Series, z: BalanceZone) -> bool:
     bottom = z.center - z.half
@@ -574,111 +576,113 @@ def price_inside_zone(price: float, z: BalanceZone) -> bool:
     return bottom <= float(price) <= top
 
 
-def balance_role(z: BalanceZone, ref_close: float) -> str:
-    """Classificazione operativa identica al motore Balance originale."""
-    inside = z.center - z.half <= ref_close <= z.center + z.half
-    if inside:
-        return "BALANCE"
-    enough_independent = z.independent_tests >= 2 and not pd.isna(z.reliability) and z.reliability >= 35.0
-    if enough_independent:
-        support_dom = z.independent_support_success >= 2 and z.independent_support_success >= max(1.0, z.independent_resistance_success * 1.35)
-        resistance_dom = z.independent_resistance_success >= 2 and z.independent_resistance_success >= max(1.0, z.independent_support_success * 1.35)
-        if z.center < ref_close and support_dom:
-            return "SUPPORTO"
-        if z.center > ref_close and resistance_dom:
-            return "RESISTENZA"
-    compatible_support = z.support_hits >= 2 and z.support_hits >= max(1.0, z.resistance_hits * 1.35)
-    compatible_resistance = z.resistance_hits >= 2 and z.resistance_hits >= max(1.0, z.support_hits * 1.35)
-    if z.center < ref_close and (compatible_support or z.hits >= 2):
-        return "SUPPORTO"
-    if z.center > ref_close and (compatible_resistance or z.hits >= 2):
-        return "RESISTENZA"
-    return "BALANCE"
+def _v44_active_metrics(data: pd.DataFrame, z: BalanceZone) -> dict[str, Any]:
+    """Stesse regole V4.4, applicate alle ultime 3 Daily CHIUSE."""
+    if data.empty or len(data) < INTERACTION_WINDOW:
+        return {"active": False, "touches": 0, "touch_flags": [False] * INTERACTION_WINDOW, "score": math.nan}
+    recent = data.iloc[-INTERACTION_WINDOW:]
+    flags = [candle_touches_zone(recent.iloc[i], z) for i in range(INTERACTION_WINDOW)]
+    touches = int(sum(flags))
+    last_close = float(data.iloc[-1]["close"])
+    inside = price_inside_zone(last_close, z)
+
+    active = touches >= MIN_INTERACTION_BARS and inside
+
+    rel_score = 50.0 if pd.isna(z.reliability) else float(z.reliability)
+    touch_score = 100.0 * float(touches) / float(INTERACTION_WINDOW)
+    score = 0.45 * touch_score + 0.35 * float(z.strength) + 0.20 * rel_score
+    score = max(0.0, min(100.0, score))
+    return {
+        "active": active,
+        "touches": touches,
+        "touch_flags": flags,
+        "inside": inside,
+        "score": score,
+    }
 
 
-def active_zone_rows(
-    label: str, ticker: str, data: pd.DataFrame, balance: dict[str, Any], require_last_close_inside: bool, min_touches: int
-) -> list[dict[str, Any]]:
-    if data.empty or len(data) < LAST_TOUCH_BARS:
-        return []
+def active_zone_row(label: str, ticker: str, data: pd.DataFrame, balance: dict[str, Any]) -> dict[str, Any] | None:
+    """V4.4 restituisce UNA sola Balance per ticker: quella attiva con Score più alto."""
+    if data.empty or len(data) < INTERACTION_WINDOW:
+        return None
 
-    recent = data.iloc[-LAST_TOUCH_BARS:]
-    last_closed = data.iloc[-1]
-    last_close = float(last_closed["close"])
+    last_close = float(data.iloc[-1]["close"])
     last_date = pd.Timestamp(data.index[-1])
-    rows: list[dict[str, Any]] = []
+    best_score = -1.0
+    best_idx = -1
+    best_zone: BalanceZone | None = None
+    best_metrics: dict[str, Any] | None = None
 
     for idx, z in enumerate(balance.get("zones", []), start=1):
-        touches = [candle_touches_zone(recent.iloc[i], z) for i in range(LAST_TOUCH_BARS)]
-        touch_count = int(sum(touches))
-        close_inside = price_inside_zone(last_close, z)
-        active = touch_count >= int(min_touches) and (close_inside if require_last_close_inside else True)
-        if not active:
+        m = _v44_active_metrics(data, z)
+        if not m["active"]:
             continue
+        if float(m["score"]) > best_score:
+            best_score = float(m["score"])
+            best_idx = idx
+            best_zone = z
+            best_metrics = m
 
-        rows.append({
-            "Strumento": label,
-            "Ticker": ticker,
-            "Area": "AREA ATTIVA",
-            "Ruolo": balance_role(z, last_close),
-            "Ultimo Close": last_close,
-            "Balance": z.center,
-            "Zona min": z.center - z.half,
-            "Zona max": z.center + z.half,
-            "Tocchi ultime 5 chiuse": f"{touch_count}/5",
-            "Tocco -4": "SI" if touches[0] else "NO",
-            "Tocco -3": "SI" if touches[1] else "NO",
-            "Tocco -2": "SI" if touches[2] else "NO",
-            "Tocco -1": "SI" if touches[3] else "NO",
-            "Tocco 0": "SI" if touches[4] else "NO",
-            "Ultimo Close dentro": "SI" if close_inside else "NO",
-            "H": z.hits,
-            "Strength": z.strength,
-            "Test indipendenti": z.independent_tests,
-            "Successi indipendenti": z.independent_successes,
-            "Break indipendenti": z.independent_breaks,
-            "Reliability %": z.reliability,
-            "Support H": z.support_hits,
-            "Resistance H": z.resistance_hits,
-            "Dwell": z.dwell,
-            "Last Hit Age": z.last_hit_age,
-            "Data ultima Daily chiusa": last_date.strftime("%Y-%m-%d"),
-            "_zone_index": idx,
-        })
-    return rows
+    if best_zone is None or best_metrics is None:
+        return None
+
+    flags = best_metrics["touch_flags"]
+    z = best_zone
+    return {
+        "Strumento": label,
+        "Ticker": ticker,
+        "Area": "AREA ATTIVA",
+        "Ultimo Close": last_close,
+        "Balance": z.center,
+        "Zona min": z.center - z.half,
+        "Zona max": z.center + z.half,
+        "Tocchi": f"{int(best_metrics['touches'])}/{INTERACTION_WINDOW}",
+        "Tocco -2": "SI" if flags[0] else "NO",
+        "Tocco -1": "SI" if flags[1] else "NO",
+        "Tocco 0": "SI" if flags[2] else "NO",
+        "Ultimo Close dentro": "SI",
+        "Score": best_score,
+        "ST": z.strength,
+        "H": z.hits,
+        "T": z.independent_tests,
+        "R %": z.reliability,
+        "Successi indipendenti": z.independent_successes,
+        "Break indipendenti": z.independent_breaks,
+        "Support H": z.support_hits,
+        "Resistance H": z.resistance_hits,
+        "Dwell": z.dwell,
+        "Last Hit Age": z.last_hit_age,
+        "Data ultima Daily chiusa": last_date.strftime("%Y-%m-%d"),
+        "_zone_index": best_idx,
+    }
 
 
-def all_balance_rows(
-    label: str, ticker: str, data: pd.DataFrame, balance: dict[str, Any], require_last_close_inside: bool, min_touches: int
-) -> list[dict[str, Any]]:
+def all_balance_rows(label: str, ticker: str, data: pd.DataFrame, balance: dict[str, Any]) -> list[dict[str, Any]]:
+    """Diagnostica: tutte le Balance selezionate dal motore, senza etichette inventate."""
     if data.empty:
         return []
     last_close = float(data.iloc[-1]["close"])
-    recent = data.iloc[-min(LAST_TOUCH_BARS, len(data)):]
     rows: list[dict[str, Any]] = []
     for idx, z in enumerate(balance.get("zones", []), start=1):
-        touches = [candle_touches_zone(recent.iloc[i], z) for i in range(len(recent))]
-        touch_count = int(sum(touches))
-        close_inside = price_inside_zone(last_close, z)
-        active = len(recent) == LAST_TOUCH_BARS and touch_count >= int(min_touches) and (close_inside if require_last_close_inside else True)
+        m = _v44_active_metrics(data, z)
         rows.append({
             "Strumento": label,
             "Ticker": ticker,
             "Zona #": idx,
-            "Area attiva": "SI" if active else "NO",
-            "Ruolo": balance_role(z, last_close),
+            "Area attiva V4.4": "SI" if m["active"] else "NO",
             "Ultimo Close": last_close,
             "Balance": z.center,
             "Zona min": z.center - z.half,
             "Zona max": z.center + z.half,
-            "Tocchi ultime 5 chiuse": f"{touch_count}/5" if len(recent) == 5 else str(touch_count),
-            "Ultimo Close dentro": "SI" if close_inside else "NO",
+            "Tocchi": f"{int(m['touches'])}/{INTERACTION_WINDOW}",
+            "Ultimo Close dentro": "SI" if m.get("inside", False) else "NO",
+            "Score V4.4": m["score"],
+            "ST": z.strength,
             "H": z.hits,
-            "Strength": z.strength,
-            "Test indipendenti": z.independent_tests,
+            "T": z.independent_tests,
+            "R %": z.reliability,
             "Successi indipendenti": z.independent_successes,
             "Break indipendenti": z.independent_breaks,
-            "Reliability %": z.reliability,
             "Support H": z.support_hits,
             "Resistance H": z.resistance_hits,
             "Dwell": z.dwell,
@@ -690,7 +694,8 @@ def all_balance_rows(
 # =============================================================================
 # CHART / EXCEL
 # =============================================================================
-def plot_balance(data: pd.DataFrame, balance: dict[str, Any], ticker: str, active_center: float) -> go.Figure:
+def plot_balance(data: pd.DataFrame, ticker: str, active_center: float, active_bottom: float, active_top: float) -> go.Figure:
+    """Grafico di verifica V4.4: mostra SOLO la Balance attiva selezionata."""
     chart = data.tail(220)
     fig = go.Figure(data=[go.Candlestick(
         x=chart.index,
@@ -698,51 +703,21 @@ def plot_balance(data: pd.DataFrame, balance: dict[str, Any], ticker: str, activ
         name=ticker,
     )])
 
-    # Colori coerenti con il grafico TradingView:
-    # SUPPORTO = verde, RESISTENZA = arancione, BALANCE neutra = grigio.
-    role_style = {
-        "SUPPORTO": {
-            "line": "rgba(0,170,105,0.95)",
-            "line_selected": "rgba(0,210,130,1.0)",
-            "fill": "rgba(0,170,105,0.10)",
-            "fill_selected": "rgba(0,170,105,0.28)",
-        },
-        "RESISTENZA": {
-            "line": "rgba(255,130,55,0.95)",
-            "line_selected": "rgba(255,155,70,1.0)",
-            "fill": "rgba(255,130,55,0.10)",
-            "fill_selected": "rgba(255,130,55,0.28)",
-        },
-        "BALANCE": {
-            "line": "rgba(150,150,150,0.70)",
-            "line_selected": "rgba(205,205,205,1.0)",
-            "fill": "rgba(150,150,150,0.07)",
-            "fill_selected": "rgba(180,180,180,0.20)",
-        },
-    }
-
-    ref_close = float(balance.get("close", chart["close"].iloc[-1]))
-    for z in balance.get("zones", []):
-        role = balance_role(z, ref_close)
-        style = role_style.get(role, role_style["BALANCE"])
-        selected = abs(z.center - active_center) <= max(1e-12, z.half * 0.05)
-        fill = style["fill_selected"] if selected else style["fill"]
-        line = style["line_selected"] if selected else style["line"]
-        width = 3 if selected else 1
-        fig.add_hrect(y0=z.center - z.half, y1=z.center + z.half, fillcolor=fill, line_width=0)
-        fig.add_hline(y=z.center, line_width=width, line_color=line)
-
-    # Tracce vuote solo per la legenda colori.
-    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color="rgba(0,170,105,0.95)", width=3), name="Supporto"))
-    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color="rgba(255,130,55,0.95)", width=3), name="Resistenza"))
-    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color="rgba(150,150,150,0.80)", width=2), name="Balance neutra"))
+    fig.add_hrect(
+        y0=float(active_bottom), y1=float(active_top),
+        fillcolor="rgba(245, 183, 0, 0.22)",
+        line_width=0,
+        annotation_text="AREA ATTIVA V4.4",
+        annotation_position="top left",
+    )
+    fig.add_hline(y=float(active_center), line_width=3, line_color="rgba(245, 183, 0, 1.0)")
 
     fig.update_layout(
-        title=f"{ticker} · Daily chiusa · Balance attiva evidenziata",
+        title=f"{ticker} · Daily chiusa · Balance attiva V4.4",
         height=650,
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=20, r=20, t=75, b=20),
+        showlegend=False,
+        margin=dict(l=20, r=20, t=65, b=20),
     )
     return fig
 
@@ -769,12 +744,12 @@ def excel_bytes(active: pd.DataFrame, all_zones: pd.DataFrame, errors: list[dict
             ws.set_row(0, 24, header)
             for j, col in enumerate(df.columns):
                 width = min(28, max(11, len(str(col)) + 2))
-                if col in {"Strumento", "Ticker", "Area", "Tocchi ultime 5 chiuse"}:
+                if col in {"Strumento", "Ticker", "Area", "Tocchi"}:
                     width = max(width, 16)
                 fmt = None
                 if col in {"Ultimo Close", "Balance", "Zona min", "Zona max"}:
                     fmt = n4
-                elif col in {"Strength", "Reliability %"}:
+                elif col in {"ST", "R %", "Score", "Score V4.4"}:
                     fmt = n2
                 ws.set_column(j, j, width, fmt)
             if len(df) and "Area attiva" in df.columns:
@@ -783,8 +758,8 @@ def excel_bytes(active: pd.DataFrame, all_zones: pd.DataFrame, errors: list[dict
     return out.getvalue()
 
 
-def scan_signature(universe: list[tuple[str, str]], market: str, adjusted: bool, require_last_close_inside: bool, min_touches: int) -> str:
-    raw = "|".join([market, str(bool(adjusted)), str(bool(require_last_close_inside)), str(int(min_touches))] + [t for _, t in universe])
+def scan_signature(universe: list[tuple[str, str]], market: str, adjusted: bool) -> str:
+    raw = "|".join([market, str(bool(adjusted))] + [t for _, t in universe])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -793,36 +768,17 @@ def scan_signature(universe: list[tuple[str, str]], market: str, adjusted: bool,
 # =============================================================================
 with st.sidebar:
     st.header("Impostazioni")
-    st.caption("Build V2.9")
+    st.caption("Build V3.0 · logica V4.4")
     market_choice = st.selectbox(
         "Mercato lista",
         ["Automatico", "Italia", "USA", "Misto / ticker Yahoo completi"],
         index=0,
         help="Automatico: riconosce i file italiani con ticker .MI e i file USA con ticker standard.",
     )
-    role_filter = st.selectbox(
-        "Mostra aree",
-        ["Supporto", "Resistenza", "Entrambi"],
-        index=0,
-        help="Filtro solo di visualizzazione: non rilancia lo screening. Supporto/Resistenza usa il ruolo del motore Balance originale.",
-    )
     adjusted = st.checkbox(
         "Prezzi Yahoo adjusted",
         value=False,
         help="È una scelta della serie dati, non un filtro dello screener. Per confronti con TradingView usa la stessa impostazione di aggiustamento del grafico.",
-    )
-    require_last_close_inside = st.checkbox(
-        "Richiedi ultimo Close Daily dentro la Balance",
-        value=False,
-        help="ON: oltre al numero minimo di tocchi reali nelle ultime 5 Daily chiuse, l'ultimo Close deve essere dentro la stessa fascia.",
-    )
-    min_touches = st.number_input(
-        "Tocchi minimi",
-        min_value=1,
-        max_value=5,
-        value=DEFAULT_MIN_TOUCHES,
-        step=1,
-        help="Numero minimo di Daily chiuse, tra le ultime 5, che devono intersecare realmente la stessa Balance.",
     )
     uploaded = st.file_uploader("File ticker .txt", type=["txt", "csv"])
     use_manual = st.checkbox("Modifica/incolla ticker manualmente", value=uploaded is None)
@@ -850,7 +806,7 @@ else:
 
 market = infer_market_from_text(text, source_name) if market_choice == "Automatico" else market_choice
 universe = parse_tickers(text, market)
-current_signature = scan_signature(universe, market, adjusted, require_last_close_inside, int(min_touches))
+current_signature = scan_signature(universe, market, adjusted)
 
 with st.sidebar:
     if text.strip():
@@ -870,7 +826,7 @@ if run:
 
     # Elimina subito il risultato precedente: durante una scansione USA non deve
     # restare visibile la vecchia tabella italiana.
-    st.session_state.pop("balance_stock_screener_v2_9", None)
+    st.session_state.pop("balance_stock_screener_v3_0", None)
 
     labels = {ticker: label for label, ticker in universe}
     tickers = [ticker for _, ticker in universe]
@@ -894,27 +850,27 @@ if run:
             if not balance.get("available"):
                 errors.append({"Ticker": ticker, "Errore": str(balance.get("detail", "Balance non disponibili"))})
                 continue
-            active_rows.extend(active_zone_rows(labels[ticker], ticker, data, balance, require_last_close_inside, int(min_touches)))
-            all_rows.extend(all_balance_rows(labels[ticker], ticker, data, balance, require_last_close_inside, int(min_touches)))
+            row = active_zone_row(labels[ticker], ticker, data, balance)
+            if row is not None:
+                active_rows.append(row)
+            all_rows.extend(all_balance_rows(labels[ticker], ticker, data, balance))
             details[ticker] = (data, balance, labels[ticker])
         except Exception as exc:
             errors.append({"Ticker": ticker, "Errore": f"{type(exc).__name__}: {exc}"})
 
     progress.progress(1.0, text="Completato")
-    st.session_state["balance_stock_screener_v2_9"] = {
+    st.session_state["balance_stock_screener_v3_0"] = {
         "signature": current_signature,
         "active_rows": active_rows,
         "all_rows": all_rows,
         "details": details,
         "errors": errors,
         "adjusted": bool(adjusted),
-        "require_last_close_inside": bool(require_last_close_inside),
-        "min_touches": int(min_touches),
         "total_tickers": len(tickers),
         "downloaded_tickers": len(data_map),
     }
 
-payload = st.session_state.get("balance_stock_screener_v2_9")
+payload = st.session_state.get("balance_stock_screener_v3_0")
 if payload and payload.get("signature") == current_signature:
     active_rows = payload["active_rows"]
     all_rows = payload["all_rows"]
@@ -939,70 +895,68 @@ if payload and payload.get("signature") == current_signature:
 
     st.subheader("Aree Balance attive")
     if active.empty:
-        rule = f"almeno {int(payload.get('min_touches', DEFAULT_MIN_TOUCHES))} tocchi reali nelle ultime 5 Daily chiuse" + (" + ultimo Close dentro la Balance" if payload.get("require_last_close_inside", False) else "")
-        st.info(f"Nessuna AREA ATTIVA con la regola selezionata: {rule}.")
+        st.info("Nessuna AREA ATTIVA V4.4: servono almeno 2 tocchi reali nelle ultime 3 Daily chiuse e l'ultimo Close deve essere dentro la stessa Balance.")
         active_view = active.copy()
     else:
-        active["_touch_num"] = active["Tocchi ultime 5 chiuse"].str.extract(r"(\d+)")[0].astype(int)
-        active = active.sort_values(["_touch_num", "Strength", "Strumento"], ascending=[False, False, True]).reset_index(drop=True)
-        if role_filter == "Supporto":
-            active_view = active[active["Ruolo"] == "SUPPORTO"].copy()
-        elif role_filter == "Resistenza":
-            active_view = active[active["Ruolo"] == "RESISTENZA"].copy()
-        else:
-            active_view = active.copy()
+        active = active.sort_values(["Score", "ST", "Strumento"], ascending=[False, False, True]).reset_index(drop=True)
+        active_view = active.copy()
+        visible = [
+            "Strumento", "Ticker", "Area", "Ultimo Close", "Balance", "Zona min", "Zona max",
+            "Tocchi", "Tocco -2", "Tocco -1", "Tocco 0", "Score", "ST", "H", "T", "R %",
+            "Data ultima Daily chiusa",
+        ]
+        st.dataframe(
+            active_view[visible],
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Ultimo Close": st.column_config.NumberColumn("Ultimo Close", format="%.4f"),
+                "Balance": st.column_config.NumberColumn("Balance", format="%.4f"),
+                "Zona min": st.column_config.NumberColumn("Zona min", format="%.4f"),
+                "Zona max": st.column_config.NumberColumn("Zona max", format="%.4f"),
+                "Score": st.column_config.NumberColumn("Score", format="%.1f"),
+                "ST": st.column_config.NumberColumn("ST", format="%.1f"),
+                "R %": st.column_config.NumberColumn("R %", format="%.1f"),
+            },
+        )
 
-        if active_view.empty:
-            st.info(f"Nessuna AREA ATTIVA classificata come {role_filter.upper()} con i filtri correnti.")
-        else:
-            visible = [
-                "Strumento", "Ticker", "Area", "Ruolo", "Ultimo Close", "Balance", "Zona min", "Zona max",
-                "Tocchi ultime 5 chiuse", "Tocco -4", "Tocco -3", "Tocco -2", "Tocco -1", "Tocco 0", "Ultimo Close dentro",
-                "H", "Strength", "Test indipendenti", "Successi indipendenti", "Break indipendenti", "Reliability %",
-                "Data ultima Daily chiusa",
-            ]
-            st.dataframe(
-                active_view[visible],
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "Ultimo Close": st.column_config.NumberColumn("Ultimo Close", format="%.4f"),
-                    "Balance": st.column_config.NumberColumn("Balance", format="%.4f"),
-                    "Zona min": st.column_config.NumberColumn("Zona min", format="%.4f"),
-                    "Zona max": st.column_config.NumberColumn("Zona max", format="%.4f"),
-                    "Strength": st.column_config.NumberColumn("Strength", format="%.1f"),
-                    "Reliability %": st.column_config.NumberColumn("Reliability %", format="%.1f"),
-                },
-            )
-
-    active_export = active.drop(columns=["_zone_index", "_touch_num", "_select"], errors="ignore") if not active.empty else pd.DataFrame(columns=[
-        "Strumento", "Ticker", "Area", "Ruolo", "Ultimo Close", "Balance", "Zona min", "Zona max", "Tocchi ultime 5 chiuse",
-        "Ultimo Close dentro", "H", "Strength", "Test indipendenti", "Successi indipendenti", "Break indipendenti", "Reliability %"
+    active_export = active.drop(columns=["_zone_index", "_select"], errors="ignore") if not active.empty else pd.DataFrame(columns=[
+        "Strumento", "Ticker", "Area", "Ultimo Close", "Balance", "Zona min", "Zona max",
+        "Tocchi", "Score", "ST", "H", "T", "R %"
     ])
     all_export = all_zones.copy()
     xlsx = excel_bytes(active_export, all_export, errors)
     st.download_button(
         "⬇️ Esporta Excel",
         data=xlsx,
-        file_name="balance_stock_active_daily_closed.xlsx",
+        file_name="balance_stock_active_v44_daily_closed.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
     if not active_view.empty:
         st.subheader("Verifica grafica")
-        active_view["_select"] = active_view["Ticker"].astype(str) + " | " + active_view["Ruolo"].astype(str) + " | " + active_view["Balance"].map(lambda x: f"{x:.4f}")
-        selected_key = st.selectbox("Area attiva", active_view["_select"].tolist(), key="balance_stock_active_chart")
+        active_view["_select"] = active_view["Ticker"].astype(str) + " | " + active_view["Balance"].map(lambda x: f"{x:.4f}")
+        selected_key = st.selectbox("Area attiva", active_view["_select"].tolist(), key="balance_stock_active_chart_v44")
         selected_row = active_view[active_view["_select"] == selected_key].iloc[0]
         ticker = str(selected_row["Ticker"])
         data, balance, _ = details[ticker]
-        st.plotly_chart(plot_balance(data, balance, ticker, float(selected_row["Balance"])), use_container_width=True)
+        st.plotly_chart(
+            plot_balance(
+                data,
+                ticker,
+                float(selected_row["Balance"]),
+                float(selected_row["Zona min"]),
+                float(selected_row["Zona max"]),
+            ),
+            use_container_width=True,
+        )
         a, b, c, d = st.columns(4)
         a.metric("Ultimo Close", f"{float(selected_row['Ultimo Close']):.4f}")
         b.metric("Balance", f"{float(selected_row['Balance']):.4f}")
-        c.metric("Tocchi ultime 5 chiuse", str(selected_row["Tocchi ultime 5 chiuse"]))
-        d.metric("Reliability", "n/d" if pd.isna(selected_row["Reliability %"]) else f"{float(selected_row['Reliability %']):.0f}%")
+        c.metric("Tocchi", str(selected_row["Tocchi"]))
+        d.metric("Score V4.4", f"{float(selected_row['Score']):.1f}")
 
-    with st.expander("Tutte le Balance calcolate"):
+    with st.expander("Tutte le Balance calcolate · diagnostica"):
         if all_zones.empty:
             st.info("Nessuna Balance disponibile.")
         else:
