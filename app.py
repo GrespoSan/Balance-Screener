@@ -697,18 +697,52 @@ def plot_balance(data: pd.DataFrame, balance: dict[str, Any], ticker: str, activ
         open=chart["open"], high=chart["high"], low=chart["low"], close=chart["close"],
         name=ticker,
     )])
+
+    # Colori coerenti con il grafico TradingView:
+    # SUPPORTO = verde, RESISTENZA = arancione, BALANCE neutra = grigio.
+    role_style = {
+        "SUPPORTO": {
+            "line": "rgba(0,170,105,0.95)",
+            "line_selected": "rgba(0,210,130,1.0)",
+            "fill": "rgba(0,170,105,0.10)",
+            "fill_selected": "rgba(0,170,105,0.28)",
+        },
+        "RESISTENZA": {
+            "line": "rgba(255,130,55,0.95)",
+            "line_selected": "rgba(255,155,70,1.0)",
+            "fill": "rgba(255,130,55,0.10)",
+            "fill_selected": "rgba(255,130,55,0.28)",
+        },
+        "BALANCE": {
+            "line": "rgba(150,150,150,0.70)",
+            "line_selected": "rgba(205,205,205,1.0)",
+            "fill": "rgba(150,150,150,0.07)",
+            "fill_selected": "rgba(180,180,180,0.20)",
+        },
+    }
+
+    ref_close = float(balance.get("close", chart["close"].iloc[-1]))
     for z in balance.get("zones", []):
+        role = balance_role(z, ref_close)
+        style = role_style.get(role, role_style["BALANCE"])
         selected = abs(z.center - active_center) <= max(1e-12, z.half * 0.05)
-        fill = "rgba(255,215,0,0.28)" if selected else "rgba(120,120,120,0.10)"
-        line = "rgba(220,170,0,1.0)" if selected else "rgba(120,120,120,0.65)"
-        width = 2 if selected else 1
+        fill = style["fill_selected"] if selected else style["fill"]
+        line = style["line_selected"] if selected else style["line"]
+        width = 3 if selected else 1
         fig.add_hrect(y0=z.center - z.half, y1=z.center + z.half, fillcolor=fill, line_width=0)
         fig.add_hline(y=z.center, line_width=width, line_color=line)
+
+    # Tracce vuote solo per la legenda colori.
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color="rgba(0,170,105,0.95)", width=3), name="Supporto"))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color="rgba(255,130,55,0.95)", width=3), name="Resistenza"))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color="rgba(150,150,150,0.80)", width=2), name="Balance neutra"))
+
     fig.update_layout(
         title=f"{ticker} · Daily chiusa · Balance attiva evidenziata",
         height=650,
         xaxis_rangeslider_visible=False,
-        margin=dict(l=20, r=20, t=55, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=20, r=20, t=75, b=20),
     )
     return fig
 
@@ -759,7 +793,7 @@ def scan_signature(universe: list[tuple[str, str]], market: str, adjusted: bool,
 # =============================================================================
 with st.sidebar:
     st.header("Impostazioni")
-    st.caption("Build V2.8")
+    st.caption("Build V2.9")
     market_choice = st.selectbox(
         "Mercato lista",
         ["Automatico", "Italia", "USA", "Misto / ticker Yahoo completi"],
@@ -836,7 +870,7 @@ if run:
 
     # Elimina subito il risultato precedente: durante una scansione USA non deve
     # restare visibile la vecchia tabella italiana.
-    st.session_state.pop("balance_stock_screener_v2_7", None)
+    st.session_state.pop("balance_stock_screener_v2_9", None)
 
     labels = {ticker: label for label, ticker in universe}
     tickers = [ticker for _, ticker in universe]
@@ -867,7 +901,7 @@ if run:
             errors.append({"Ticker": ticker, "Errore": f"{type(exc).__name__}: {exc}"})
 
     progress.progress(1.0, text="Completato")
-    st.session_state["balance_stock_screener_v2_7"] = {
+    st.session_state["balance_stock_screener_v2_9"] = {
         "signature": current_signature,
         "active_rows": active_rows,
         "all_rows": all_rows,
@@ -880,7 +914,7 @@ if run:
         "downloaded_tickers": len(data_map),
     }
 
-payload = st.session_state.get("balance_stock_screener_v2_7")
+payload = st.session_state.get("balance_stock_screener_v2_9")
 if payload and payload.get("signature") == current_signature:
     active_rows = payload["active_rows"]
     all_rows = payload["all_rows"]
