@@ -5,6 +5,8 @@ from typing import Any
 import io
 import math
 import re
+from datetime import time
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -16,12 +18,16 @@ import yfinance as yf
 # =============================================================================
 # PAGE
 # =============================================================================
-st.set_page_config(page_title="G. Balance Alignment Screener V3", page_icon="⚖️", layout="wide")
-st.title("⚖️ G. Balance Alignment Screener V3")
+st.set_page_config(page_title="G. Balance Stock Active V2.1", page_icon="🎯", layout="wide")
+st.title("🎯 G. Balance Stock Active V2.1 — Daily chiusa")
+
+LOOKBACK = 500
+LAST_TOUCH_BARS = 3
+MIN_TOUCHES = 2
 
 
 # =============================================================================
-# MODEL
+# MODEL — stesso data model Balance usato nel motore COT Smart Money
 # =============================================================================
 @dataclass(frozen=True)
 class BalanceZone:
@@ -43,9 +49,22 @@ class BalanceZone:
 
 
 # =============================================================================
-# INPUT / DATA
+# TICKERS
 # =============================================================================
-def parse_tickers(text: str) -> list[tuple[str, str]]:
+def normalize_stock_ticker(ticker: str, market: str) -> str:
+    t = ticker.strip().upper()
+    if not t:
+        return t
+    if market == "Italia":
+        if "." not in t and "=" not in t and ":" not in t:
+            t = f"{t}.MI"
+    elif market == "USA":
+        if re.fullmatch(r"[A-Z0-9]+\.[A-Z]", t):
+            t = t.replace(".", "-")
+    return t
+
+
+def parse_tickers(text: str, market: str) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
     for raw in text.splitlines():
@@ -53,101 +72,197 @@ def parse_tickers(text: str) -> list[tuple[str, str]]:
         if not line or line.startswith("#"):
             continue
         parts = [p.strip() for p in re.split(r"[;,\t]", line) if p.strip()]
+        if not parts:
+            continue
         if len(parts) >= 2:
-            label, ticker = parts[0], parts[-1]
+            label, raw_ticker = parts[0], parts[-1]
         else:
-            ticker = parts[0]
-            label = ticker
-        ticker = ticker.upper()
-        if ticker not in seen:
+            label, raw_ticker = parts[0], parts[0]
+        ticker = normalize_stock_ticker(raw_ticker, market)
+        if ticker and ticker not in seen:
             out.append((label, ticker))
             seen.add(ticker)
     return out
 
 
+def italy_example() -> str:
+    return """# Nome;Ticker
+A2A;A2A
+Amplifon;AMP
+Azimut;AZM
+Banco BPM;BAMI
+Brunello Cucinelli;BC
+Banca Generali;BGN
+MPS;BMPS
+BPER Banca;BPE
+Buzzi;BZU
+Campari;CPR
+DiaSorin;DIA
+Enel;ENEL
+Eni;ENI
+ERG;ERG
+Fineco;FBK
+Generali;G
+Hera;HER
+Inwit;INW
+Intesa Sanpaolo;ISP
+Iveco;IVG
+Leonardo;LDO
+Mediobanca;MB
+Moncler;MONC
+Nexi;NEXI
+Pirelli;PIRC
+Prysmian;PRY
+Poste Italiane;PST
+Ferrari;RACE
+Recordati;REC
+Saipem;SPM
+Snam;SRG
+Stellantis;STLAM
+STM;STMMI
+Tenaris;TEN
+Telecom Italia;TIT
+Terna;TRN
+UniCredit;UCG
+Unipol;UNI
+"""
+
+
+def usa_example() -> str:
+    return """# Nome;Ticker
+Apple;AAPL
+Microsoft;MSFT
+Nvidia;NVDA
+Amazon;AMZN
+Alphabet;GOOGL
+Meta;META
+Tesla;TSLA
+Broadcom;AVGO
+Berkshire Hathaway;BRK-B
+JPMorgan;JPM
+Visa;V
+Mastercard;MA
+Eli Lilly;LLY
+UnitedHealth;UNH
+Exxon Mobil;XOM
+Costco;COST
+Walmart;WMT
+Netflix;NFLX
+AMD;AMD
+Salesforce;CRM
+"""
+
+
+# =============================================================================
+# DATA
+# =============================================================================
 def _normalize_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     x = df.copy()
-    if isinstance(x.columns, pd.MultiIndex):
-        x.columns = [str(c[0]).lower() for c in x.columns]
-    else:
-        x.columns = [str(c).lower() for c in x.columns]
-    if "adj close" in x.columns:
-        x = x.rename(columns={"adj close": "adj_close"})
-    need = ["open", "high", "low", "close"]
-    if any(c not in x.columns for c in need):
+    x.columns = [str(c).lower().replace(" ", "_") for c in x.columns]
+    required = ["open", "high", "low", "close"]
+    if any(c not in x.columns for c in required):
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     if "volume" not in x.columns:
         x["volume"] = np.nan
     x = x[["open", "high", "low", "close", "volume"]].copy()
     for c in x.columns:
         x[c] = pd.to_numeric(x[c], errors="coerce")
-    x = x.dropna(subset=["open", "high", "low", "close"])
+    x = x.dropna(subset=required)
     x = x[~x.index.duplicated(keep="last")].sort_index()
     return x
 
 
-def _drop_open_bar(df: pd.DataFrame, timeframe: str) -> tuple[pd.DataFrame, bool]:
-    if df.empty or len(df) < 2:
-        return df, False
-    x = df.copy()
-    last = pd.Timestamp(x.index[-1])
-    try:
-        now = pd.Timestamp.now(tz=last.tz) if last.tz is not None else pd.Timestamp.now()
-    except Exception:
-        now = pd.Timestamp.now()
-
-    if timeframe == "Daily":
-        last_day = last.tz_localize(None).date() if last.tz is not None else last.date()
-        now_day = now.tz_localize(None).date() if getattr(now, "tz", None) is not None else now.date()
-        remove = last_day >= now_day
-    else:
-        delta = pd.Timedelta(hours=1 if timeframe == "H1" else 4)
+def _extract_from_batch(raw: pd.DataFrame, ticker: str, single: bool) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    if single and not isinstance(raw.columns, pd.MultiIndex):
+        return _normalize_ohlc(raw)
+    if isinstance(raw.columns, pd.MultiIndex):
+        lvl0 = set(map(str, raw.columns.get_level_values(0)))
+        lvl1 = set(map(str, raw.columns.get_level_values(1)))
         try:
-            remove = last + delta > now
-        except TypeError:
-            remove = last.tz_localize(None) + delta > now.tz_localize(None)
-    return (x.iloc[:-1].copy(), True) if remove else (x, False)
-
-
-def _resample_h4(h1: pd.DataFrame) -> pd.DataFrame:
-    if h1.empty:
-        return h1
-    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    h4 = h1.resample("4h", origin="start_day").agg(agg)
-    return h4.dropna(subset=["open", "high", "low", "close"])
+            if ticker in lvl0:
+                return _normalize_ohlc(raw[ticker])
+            if ticker in lvl1:
+                return _normalize_ohlc(raw.xs(ticker, axis=1, level=1))
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def load_price_data(ticker: str, timeframe: str) -> tuple[pd.DataFrame, str]:
-    ticker = ticker.strip().upper()
-    try:
-        if timeframe == "Daily":
-            raw = yf.download(ticker, period="5y", interval="1d", auto_adjust=False, progress=False, threads=False)
-            data = _normalize_ohlc(raw)
-        else:
-            raw = yf.download(ticker, period="700d", interval="1h", auto_adjust=False, progress=False, threads=False)
-            h1 = _normalize_ohlc(raw)
-            data = h1 if timeframe == "H1" else _resample_h4(h1)
-        if data.empty:
-            return data, "Nessun dato restituito da Yahoo Finance."
-        data, removed = _drop_open_bar(data, timeframe)
-        note = "Ultima barra aperta esclusa." if removed else "Ultima barra disponibile considerata chiusa."
-        return data, note
-    except Exception as exc:
-        return pd.DataFrame(), f"{type(exc).__name__}: {exc}"
+def download_daily_chunk(tickers: tuple[str, ...], adjusted: bool) -> dict[str, pd.DataFrame]:
+    if not tickers:
+        return {}
+    raw = yf.download(
+        tickers=list(tickers),
+        period="5y",
+        interval="1d",
+        auto_adjust=bool(adjusted),
+        actions=False,
+        group_by="ticker",
+        progress=False,
+        threads=True,
+    )
+    single = len(tickers) == 1
+    return {t: _extract_from_batch(raw, t, single) for t in tickers}
 
 
-# =============================================================================
-# BALANCE ENGINE V3 — Pine defaults v0.5.1.9
-# =============================================================================
-def wilder_atr(data: pd.DataFrame, length: int = 14) -> pd.Series:
+def load_universe_data(tickers: list[str], adjusted: bool) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    data_map: dict[str, pd.DataFrame] = {}
+    notes: dict[str, str] = {}
+    chunk_size = 40
+    for start in range(0, len(tickers), chunk_size):
+        chunk = tuple(tickers[start:start + chunk_size])
+        try:
+            result = download_daily_chunk(chunk, adjusted)
+        except Exception as exc:
+            for t in chunk:
+                notes[t] = f"Download batch: {type(exc).__name__}: {exc}"
+            continue
+        for t in chunk:
+            df = result.get(t, pd.DataFrame())
+            if df.empty:
+                notes[t] = "Nessun dato Yahoo Finance."
+                continue
+            data_map[t] = df
+            notes[t] = "Dati Daily acquisiti."
+    return data_map, notes
+
+
+def _market_clock_for_ticker(ticker: str, market: str) -> tuple[str, time]:
+    """Restituisce timezone e chiusura regolare per decidere se la Daily odierna è ancora aperta."""
+    if market == "Italia" or (market == "Misto / ticker Yahoo completi" and ticker.upper().endswith(".MI")):
+        return "Europe/Rome", time(17, 30)
+    return "America/New_York", time(16, 0)
+
+
+def only_closed_daily(data: pd.DataFrame, ticker: str, market: str) -> tuple[pd.DataFrame, bool]:
+    """Esclude soltanto la Daily odierna se la seduta regolare non è ancora conclusa."""
     if data.empty:
+        return data.copy(), False
+    out = data.copy()
+    tz_name, regular_close = _market_clock_for_ticker(ticker, market)
+    now_local = pd.Timestamp.now(tz=ZoneInfo(tz_name))
+    last_date = pd.Timestamp(out.index[-1]).date()
+    if last_date == now_local.date() and now_local.time().replace(tzinfo=None) < regular_close:
+        out = out.iloc[:-1].copy()
+        return out, True
+    return out, False
+
+
+# =============================================================================
+# BALANCE ENGINE — stesse definizioni del motore Python COT Smart Money
+# lookback richiesto: 500
+# =============================================================================
+def wilder_atr(daily: pd.DataFrame, length: int = 14) -> pd.Series:
+    if daily.empty:
         return pd.Series(dtype=float)
-    high = data["high"].astype(float)
-    low = data["low"].astype(float)
-    close = data["close"].astype(float)
+    high = daily["high"].astype(float)
+    low = daily["low"].astype(float)
+    close = daily["close"].astype(float)
     prev_close = close.shift(1)
     tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     atr = pd.Series(index=tr.index, dtype=float)
@@ -159,85 +274,92 @@ def wilder_atr(data: pd.DataFrame, length: int = 14) -> pd.Series:
     return atr
 
 
-def _eval_compatible(
-    data: pd.DataFrame,
-    center: float,
-    half: float,
-    scan_limit: int,
-    validation_bars: int = 10,
+def _future_close_extremes(close: np.ndarray, validation_bars: int) -> tuple[np.ndarray, np.ndarray]:
+    n = len(close)
+    fmin = np.full(n, np.nan, dtype=float)
+    fmax = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        a = i + 1
+        b = min(n, i + validation_bars + 1)
+        if a < b:
+            vals = close[a:b]
+            fmin[i] = float(np.min(vals))
+            fmax[i] = float(np.max(vals))
+    return fmin, fmax
+
+
+def _balance_eval_compatible(
+    daily: pd.DataFrame, center: float, half: float, scan_limit: int, validation_bars: int = 10
 ) -> tuple[int, int, int, int, int, float]:
-    top, bottom = center + half, center - half
-    support_hits = resistance_hits = dwell = 0
-    nearest_age: int | None = None
-    current = len(data) - 1
+    # Implementazione vettoriale equivalente alle stesse definizioni del motore originale.
+    lows = daily["low"].to_numpy(float)
+    highs = daily["high"].to_numpy(float)
+    closes = daily["close"].to_numpy(float)
+    future_min, future_max = _future_close_extremes(closes, validation_bars)
+
+    current = len(closes) - 1
     first_offset = validation_bars + 1
     last_offset = min(scan_limit - 1, current)
     if last_offset < first_offset:
         return 0, 0, 0, 0, 99999, 0.0
 
-    for offset in range(first_offset, last_offset + 1):
-        pos = current - offset
-        row = data.iloc[pos]
-        if not (float(row["low"]) <= top and float(row["high"]) >= bottom):
-            continue
-        dwell += 1
-        is_support = float(row["close"]) >= center
-        broken = False
-        for k in range(1, validation_bars + 1):
-            later = pos + k
-            if later <= current:
-                c = float(data.iloc[later]["close"])
-                if is_support and c < bottom:
-                    broken = True
-                if (not is_support) and c > top:
-                    broken = True
-        if not broken:
-            if is_support:
-                support_hits += 1
-            else:
-                resistance_hits += 1
-            nearest_age = offset if nearest_age is None else min(nearest_age, offset)
+    start_pos = current - last_offset
+    end_pos = current - first_offset
+    pos = np.arange(start_pos, end_pos + 1)
+    top, bottom = center + half, center - half
+    overlap = (lows[pos] <= top) & (highs[pos] >= bottom)
+    if not np.any(overlap):
+        return 0, 0, 0, 0, 99999, 0.0
 
+    p = pos[overlap]
+    is_support = closes[p] >= center
+    broken_support = future_min[p] < bottom
+    broken_resistance = future_max[p] > top
+    valid_support = is_support & (~broken_support)
+    valid_resistance = (~is_support) & (~broken_resistance)
+
+    support_hits = int(np.sum(valid_support))
+    resistance_hits = int(np.sum(valid_resistance))
+    dwell = int(len(p))
     hits = support_hits + resistance_hits
+    valid_any = valid_support | valid_resistance
+    nearest_age = int(np.min(current - p[valid_any])) if np.any(valid_any) else 99999
+
     hit_score = 1.0 - math.exp(-hits / 18.0)
     dwell_score = 1.0 - math.exp(-dwell / 45.0)
     role_mix = min(support_hits, resistance_hits) / max(1.0, float(max(support_hits, resistance_hits)))
-    freshness = 0.0 if nearest_age is None else math.exp(-nearest_age / 200.0)
+    freshness = 0.0 if nearest_age == 99999 else math.exp(-nearest_age / 200.0)
     density = min(1.0, hits / max(1.0, float(dwell)))
     strength = 100.0 * (0.50 * hit_score + 0.15 * dwell_score + 0.12 * role_mix + 0.13 * freshness + 0.10 * density)
     strength = max(0.0, min(100.0, strength))
-    return support_hits, resistance_hits, hits, dwell, nearest_age if nearest_age is not None else 99999, strength
+    return support_hits, resistance_hits, hits, dwell, nearest_age, strength
 
 
-def _eval_independent(
-    data: pd.DataFrame,
-    atr: pd.Series,
-    center: float,
-    half: float,
-    scan_limit: int,
-    validation_bars: int = 10,
-    cooldown_bars: int = 6,
-    min_reaction_atr: float = 0.20,
+def _balance_eval_independent(
+    daily: pd.DataFrame, atr: pd.Series, center: float, half: float, scan_limit: int,
+    validation_bars: int = 10, cooldown_bars: int = 6, min_reaction_atr: float = 0.20,
 ) -> tuple[int, int, int, int, int, float]:
     top, bottom = center + half, center - half
     tests = successes = sup_success = res_success = breaks = 0
     last_accepted: int | None = None
-    current = len(data) - 1
+    current = len(daily) - 1
     first_offset = validation_bars + 1
     last_offset = min(scan_limit - 1, current)
     if last_offset < first_offset:
         return 0, 0, 0, 0, 0, math.nan
 
+    lows = daily["low"].to_numpy(float)
+    highs = daily["high"].to_numpy(float)
+    closes = daily["close"].to_numpy(float)
+    atr_arr = atr.to_numpy(float)
+
     for offset in range(first_offset, last_offset + 1):
         pos = current - offset
-        prev_pos = pos - 1
-        if prev_pos < 0:
+        if pos - 1 < 0:
             continue
-        row = data.iloc[pos]
-        overlaps = float(row["low"]) <= top and float(row["high"]) >= bottom
-        prev_close = float(data.iloc[prev_pos]["close"])
-        previous_above = prev_close > top
-        previous_below = prev_close < bottom
+        overlaps = lows[pos] <= top and highs[pos] >= bottom
+        previous_above = closes[pos - 1] > top
+        previous_below = closes[pos - 1] < bottom
         independent_entry = overlaps and (previous_above or previous_below)
         cooldown_ok = last_accepted is None or abs(offset - last_accepted) >= cooldown_bars
         if not (independent_entry and cooldown_ok):
@@ -246,21 +368,19 @@ def _eval_independent(
         is_support_test = previous_above
         broken = False
         max_away = 0.0
-        atr_at_test = float(atr.iloc[pos]) if pos < len(atr) and not pd.isna(atr.iloc[pos]) else max(1e-12, abs(center) * 1e-6)
+        atr_at_test = atr_arr[pos] if pos < len(atr_arr) and math.isfinite(atr_arr[pos]) else max(1e-12, abs(center) * 1e-6)
         for k in range(1, validation_bars + 1):
             later = pos + k
             if later <= current:
-                rr = data.iloc[later]
-                c = float(rr["close"])
+                c = closes[later]
                 if is_support_test:
                     if c < bottom:
                         broken = True
-                    max_away = max(max_away, float(rr["high"]) - center)
+                    max_away = max(max_away, highs[later] - center)
                 else:
                     if c > top:
                         broken = True
-                    max_away = max(max_away, center - float(rr["low"]))
-
+                    max_away = max(max_away, center - lows[later])
         reacted = max_away >= atr_at_test * min_reaction_atr
         success = (not broken) and reacted
         tests += 1
@@ -278,60 +398,28 @@ def _eval_independent(
     return tests, successes, sup_success, res_success, breaks, reliability
 
 
-def _make_zone(
-    data: pd.DataFrame,
-    atr: pd.Series,
-    center: float,
-    half: float,
-    scan_limit: int,
-    range_low: float,
-    active_range: float,
-) -> BalanceZone:
-    sup, res, hits, dwell, age, strength = _eval_compatible(data, center, half, scan_limit)
-    tests, succ, ind_sup, ind_res, brk, rel = _eval_independent(data, atr, center, half, scan_limit)
-    return BalanceZone(
-        center=center,
-        half=half,
-        pct_range=100.0 * (center - range_low) / active_range,
-        strength=strength,
-        hits=hits,
-        support_hits=sup,
-        resistance_hits=res,
-        dwell=dwell,
-        last_hit_age=age,
-        independent_tests=tests,
-        independent_successes=succ,
-        independent_support_success=ind_sup,
-        independent_resistance_success=ind_res,
-        independent_breaks=brk,
-        reliability=rel,
-    )
-
-
-def _calculate_snapshot(
-    data: pd.DataFrame,
-    previous_zones: list[BalanceZone] | None = None,
-    lookback: int = 400,
+def analyze_balance_zones(
+    daily: pd.DataFrame,
+    lookback: int = LOOKBACK,
     scan_step_pct: float = 1.0,
     max_zones: int = 9,
     zone_half_atr: float = 0.12,
     min_spacing_range_pct: float = 8.0,
-    retention_strength: float = 25.0,
-    retention_tolerance_steps: float = 1.5,
-    use_retention: bool = True,
 ) -> dict[str, Any]:
-    unavailable = {"available": False, "zones": [], "detail": "Dati insufficienti."}
-    if data.empty or len(data) < max(60, min(lookback, 120)):
+    unavailable = {"available": False, "zones": [], "detail": "Dati Daily insufficienti."}
+    if daily.empty or len(daily) < max(60, min(lookback, 120)):
+        return unavailable
+    data = daily.copy().dropna(subset=["high", "low", "close"])
+    if len(data) < 60:
         return unavailable
 
-    d = data.copy().dropna(subset=["high", "low", "close"])
-    atr = wilder_atr(d, 14)
-    atr_now = float(atr.iloc[-1]) if len(atr) and not pd.isna(atr.iloc[-1]) else math.nan
+    atr = wilder_atr(data, 14)
+    atr_now = float(atr.iloc[-1]) if not atr.empty and pd.notna(atr.iloc[-1]) else math.nan
     if not math.isfinite(atr_now) or atr_now <= 0:
         return unavailable
 
-    scan_limit = min(int(lookback), len(d) - 1)
-    window = d.iloc[-min(int(lookback), len(d)):]
+    scan_limit = min(int(lookback), len(data) - 1)
+    window = data.iloc[-min(int(lookback), len(data)):]
     range_high = float(window["high"].max())
     range_low = float(window["low"].min())
     active_range = range_high - range_low
@@ -340,254 +428,178 @@ def _calculate_snapshot(
 
     half = max(1e-12, atr_now * float(zone_half_atr))
     candidates: list[tuple[float, float, int]] = []
-    steps = int(math.floor(100.0 / float(scan_step_pct)))
+    steps = int(round(100.0 / float(scan_step_pct)))
     for s in range(steps + 1):
         pct = min(100.0, s * float(scan_step_pct))
         center = range_low + active_range * pct / 100.0
-        sup, res, hits, dwell, age, strength = _eval_compatible(d, center, half, scan_limit)
+        sup, res, hits, dwell, age, strength = _balance_eval_compatible(data, center, half, scan_limit)
         if hits >= 1:
             candidates.append((center, strength, hits))
+
     if not candidates:
-        return {**unavailable, "detail": "Nessuna Balance qualificata."}
+        return {**unavailable, "detail": "Nessuna Balance qualificata nel lookback corrente."}
 
-    spacing = max(1e-12, active_range * float(min_spacing_range_pct) / 100.0)
-    retention_tolerance = active_range * float(scan_step_pct) / 100.0 * float(retention_tolerance_steps)
+    spacing = active_range * float(min_spacing_range_pct) / 100.0
     selected: list[BalanceZone] = []
-    used: set[int] = set()
-
-    # Pine v0.5.1.9: first retain previous zones when a current candidate remains
-    # sufficiently close and strong, then fill the remaining slots by strength.
-    if use_retention and previous_zones:
-        for old in previous_zones:
-            if len(selected) >= int(max_zones):
-                break
-            best_idx = None
-            best_dist = math.inf
-            for idx, (center, strength, _) in enumerate(candidates):
-                if idx in used:
-                    continue
-                dist = abs(center - old.center)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_idx = idx
-            if best_idx is None:
-                continue
-            center, strength, _ = candidates[best_idx]
-            if best_dist <= retention_tolerance and strength >= float(retention_strength):
-                if not any(abs(center - z.center) < spacing for z in selected):
-                    z = _make_zone(d, atr, center, half, scan_limit, range_low, active_range)
-                    if z.hits >= 1:
-                        selected.append(z)
-                        used.add(best_idx)
-
-    order = sorted(range(len(candidates)), key=lambda i: candidates[i][1], reverse=True)
-    for idx in order:
+    for center, _, _ in sorted(candidates, key=lambda x: x[1], reverse=True):
         if len(selected) >= int(max_zones):
             break
-        if idx in used:
-            continue
-        center, _, _ = candidates[idx]
         if any(abs(center - z.center) < spacing for z in selected):
             continue
-        z = _make_zone(d, atr, center, half, scan_limit, range_low, active_range)
-        if z.hits >= 1:
-            selected.append(z)
-            used.add(idx)
-
+        sup, res, hits, dwell, age, strength = _balance_eval_compatible(data, center, half, scan_limit)
+        tests, succ, ind_sup, ind_res, brk, rel = _balance_eval_independent(data, atr, center, half, scan_limit)
+        selected.append(BalanceZone(
+            center=center,
+            half=half,
+            pct_range=100.0 * (center - range_low) / active_range,
+            strength=strength,
+            hits=hits,
+            support_hits=sup,
+            resistance_hits=res,
+            dwell=dwell,
+            last_hit_age=age,
+            independent_tests=tests,
+            independent_successes=succ,
+            independent_support_success=ind_sup,
+            independent_resistance_success=ind_res,
+            independent_breaks=brk,
+            reliability=rel,
+        ))
     selected.sort(key=lambda z: z.center)
+    if not selected:
+        return {**unavailable, "detail": "Nessuna Balance selezionata."}
+
     return {
-        "available": bool(selected),
+        "available": True,
         "zones": selected,
-        "atr14_at_calculation": atr_now,
+        "atr14": atr_now,
         "range_high": range_high,
         "range_low": range_low,
-        "active_range": active_range,
-        "calculation_date": d.index[-1],
-        "detail": f"{len(selected)} Balance | lookback {scan_limit}",
+        "detail": f"{len(selected)} Balance selezionate | Lookback {scan_limit} Daily | ATR14 {atr_now:.4f}",
     }
 
 
-def analyze_balance_v3(
-    data: pd.DataFrame,
-    mode: str,
-    lookback: int = 400,
-    update_frequency: int = 50,
-    freeze_age: int = 0,
-) -> dict[str, Any]:
-    """Return current Balance snapshot.
-
-    Snapshot corrente = current recalculation, deterministic and comparable after a Pine reload.
-    Retention simulata = replay periodic recalculations every update_frequency bars ending
-    freeze_age bars before the latest closed bar, preserving previous zones between updates.
-    """
-    unavailable = {"available": False, "zones": [], "detail": "Dati insufficienti."}
-    if data.empty or len(data) < 120:
-        return unavailable
-
-    latest_pos = len(data) - 1
-    calc_pos = latest_pos - int(freeze_age)
-    if calc_pos < 119:
-        return unavailable
-
-    if mode == "Snapshot corrente":
-        snap = _calculate_snapshot(data.iloc[:calc_pos + 1], previous_zones=None, lookback=lookback, use_retention=False)
-    else:
-        # Deterministic replay aligned to the chosen final calculation bar. Starting one
-        # lookback before the first usable snapshot is enough to build a stable history
-        # without processing the entire 5-year series on every scan.
-        first_pos = max(119, calc_pos - max(lookback * 2, update_frequency * 10))
-        positions = list(range(first_pos, calc_pos + 1, max(1, int(update_frequency))))
-        if not positions or positions[-1] != calc_pos:
-            positions.append(calc_pos)
-        prev: list[BalanceZone] = []
-        snap = unavailable
-        for pos in positions:
-            snap = _calculate_snapshot(
-                data.iloc[:pos + 1],
-                previous_zones=prev,
-                lookback=lookback,
-                use_retention=True,
-            )
-            if snap.get("available"):
-                prev = list(snap.get("zones", []))
-
-    if not snap.get("available"):
-        return snap
-
-    current_close = float(data.iloc[-1]["close"])
-    current_atr = wilder_atr(data, 14)
-    atr_now = float(current_atr.iloc[-1]) if len(current_atr) and not pd.isna(current_atr.iloc[-1]) else math.nan
-    snap.update({
-        "close": current_close,
-        "atr14": atr_now,
-        "reference_date": pd.Timestamp(data.index[-1]),
-        "calculation_age_bars": latest_pos - calc_pos,
-        "mode": mode,
-    })
-    return snap
-
-
-def balance_role(z: BalanceZone, ref_close: float) -> str:
-    inside = z.center - z.half <= ref_close <= z.center + z.half
-    if inside:
-        return "BALANCE"
-    enough_ind = z.independent_tests >= 2 and not pd.isna(z.reliability) and z.reliability >= 35.0
-    if enough_ind:
-        support_dom = z.independent_support_success >= 2 and z.independent_support_success >= max(1.0, z.independent_resistance_success * 1.35)
-        resistance_dom = z.independent_resistance_success >= 2 and z.independent_resistance_success >= max(1.0, z.independent_support_success * 1.35)
-        if z.center < ref_close and support_dom:
-            return "SUPPORTO"
-        if z.center > ref_close and resistance_dom:
-            return "RESISTENZA"
-    comp_sup = z.support_hits >= 2 and z.support_hits >= max(1.0, z.resistance_hits * 1.35)
-    comp_res = z.resistance_hits >= 2 and z.resistance_hits >= max(1.0, z.support_hits * 1.35)
-    if z.center < ref_close and (comp_sup or z.hits >= 2):
-        return "SUPPORTO"
-    if z.center > ref_close and (comp_res or z.hits >= 2):
-        return "RESISTENZA"
-    return "BALANCE"
-
-
 # =============================================================================
-# OUTPUT TABLES / CHART
+# ACTIVE AREA — nessuna tolleranza aggiuntiva
 # =============================================================================
-def _nearest_levels(zones: list[BalanceZone], close: float, count: int = 3) -> tuple[list[float], list[float]]:
-    below = sorted([z.center for z in zones if z.center < close], reverse=True)[:count]
-    above = sorted([z.center for z in zones if z.center > close])[:count]
-    below += [math.nan] * (count - len(below))
-    above += [math.nan] * (count - len(above))
-    return below, above
+def candle_touches_zone(row: pd.Series, z: BalanceZone) -> bool:
+    bottom = z.center - z.half
+    top = z.center + z.half
+    return float(row["low"]) <= top and float(row["high"]) >= bottom
 
 
-def summary_row(label: str, ticker: str, timeframe: str, balance: dict[str, Any], note: str) -> dict[str, Any]:
-    zones: list[BalanceZone] = list(balance.get("zones", []))
-    close = float(balance.get("close", math.nan))
-    below, above = _nearest_levels(zones, close, 3)
-    inside = next((z for z in zones if z.center - z.half <= close <= z.center + z.half), None)
-    nearest = min(zones, key=lambda z: abs(z.center - close)) if zones else None
-    atr = float(balance.get("atr14", math.nan))
-    dist_atr = abs(close - nearest.center) / atr if nearest is not None and math.isfinite(atr) and atr > 0 else math.nan
-    calc_date = balance.get("calculation_date")
-    ref_date = balance.get("reference_date")
-    return {
-        "Strumento": label,
-        "Ticker": ticker,
-        "TF": timeframe,
-        "Prezzo": close,
-        "Supporto 1": below[0],
-        "Supporto 2": below[1],
-        "Supporto 3": below[2],
-        "Resistenza 1": above[0],
-        "Resistenza 2": above[1],
-        "Resistenza 3": above[2],
-        "Dentro Balance": "SI" if inside is not None else "NO",
-        "Balance corrente": inside.center if inside is not None else math.nan,
-        "Balance più vicina": nearest.center if nearest is not None else math.nan,
-        "Dist. centro ATR": dist_atr,
-        "N. Balance": len(zones),
-        "Data livelli": pd.Timestamp(calc_date).strftime("%Y-%m-%d %H:%M") if calc_date is not None else "",
-        "Età livelli barre": int(balance.get("calculation_age_bars", 0)),
-        "Barra prezzo": pd.Timestamp(ref_date).strftime("%Y-%m-%d %H:%M") if ref_date is not None else "",
-        "Modalità": balance.get("mode", ""),
-        "Nota dati": note,
-    }
+def price_inside_zone(price: float, z: BalanceZone) -> bool:
+    bottom = z.center - z.half
+    top = z.center + z.half
+    return bottom <= float(price) <= top
 
 
-def zone_rows(label: str, ticker: str, timeframe: str, balance: dict[str, Any]) -> list[dict[str, Any]]:
-    close = float(balance.get("close", math.nan))
-    atr = float(balance.get("atr14", math.nan))
+def active_zone_rows(
+    label: str, ticker: str, data: pd.DataFrame, balance: dict[str, Any], require_last_close_inside: bool
+) -> list[dict[str, Any]]:
+    if data.empty or len(data) < LAST_TOUCH_BARS:
+        return []
+
+    last3 = data.iloc[-LAST_TOUCH_BARS:]
+    last_closed = data.iloc[-1]
+    last_close = float(last_closed["close"])
+    last_date = pd.Timestamp(data.index[-1])
     rows: list[dict[str, Any]] = []
-    for i, z in enumerate(balance.get("zones", []), start=1):
-        role = balance_role(z, close)
-        dist = abs(close - z.center) / atr if math.isfinite(atr) and atr > 0 else math.nan
+
+    for idx, z in enumerate(balance.get("zones", []), start=1):
+        touches = [candle_touches_zone(last3.iloc[i], z) for i in range(LAST_TOUCH_BARS)]
+        touch_count = int(sum(touches))
+        close_inside = price_inside_zone(last_close, z)
+        active = touch_count >= MIN_TOUCHES and (close_inside if require_last_close_inside else True)
+        if not active:
+            continue
+
         rows.append({
             "Strumento": label,
             "Ticker": ticker,
-            "TF": timeframe,
-            "Ordine prezzo": i,
-            "Ruolo": role,
-            "Centro": z.center,
+            "Area": "AREA ATTIVA",
+            "Ultimo Close": last_close,
+            "Balance": z.center,
             "Zona min": z.center - z.half,
             "Zona max": z.center + z.half,
-            "Distanza ATR": dist,
+            "Tocchi ultime 3 chiuse": f"{touch_count}/3",
+            "Tocco -2": "SI" if touches[0] else "NO",
+            "Tocco -1": "SI" if touches[1] else "NO",
+            "Tocco 0": "SI" if touches[2] else "NO",
+            "Ultimo Close dentro": "SI" if close_inside else "NO",
+            "H": z.hits,
             "Strength": z.strength,
-            "Hits": z.hits,
-            "Support hits": z.support_hits,
-            "Resistance hits": z.resistance_hits,
-            "Dwell": z.dwell,
-            "Ultimo hit barre fa": z.last_hit_age,
             "Test indipendenti": z.independent_tests,
             "Successi indipendenti": z.independent_successes,
             "Break indipendenti": z.independent_breaks,
             "Reliability %": z.reliability,
+            "Support H": z.support_hits,
+            "Resistance H": z.resistance_hits,
+            "Dwell": z.dwell,
+            "Last Hit Age": z.last_hit_age,
+            "Data ultima Daily chiusa": last_date.strftime("%Y-%m-%d"),
+            "_zone_index": idx,
         })
     return rows
 
 
-def plot_balance(data: pd.DataFrame, balance: dict[str, Any], ticker: str, timeframe: str) -> go.Figure:
-    bars = 260 if timeframe == "Daily" else 360
-    chart = data.tail(bars)
-    close = float(balance.get("close", math.nan))
+def all_balance_rows(
+    label: str, ticker: str, data: pd.DataFrame, balance: dict[str, Any], require_last_close_inside: bool
+) -> list[dict[str, Any]]:
+    if data.empty:
+        return []
+    last_close = float(data.iloc[-1]["close"])
+    last3 = data.iloc[-min(LAST_TOUCH_BARS, len(data)):]
+    rows: list[dict[str, Any]] = []
+    for idx, z in enumerate(balance.get("zones", []), start=1):
+        touches = [candle_touches_zone(last3.iloc[i], z) for i in range(len(last3))]
+        touch_count = int(sum(touches))
+        close_inside = price_inside_zone(last_close, z)
+        active = len(last3) == LAST_TOUCH_BARS and touch_count >= MIN_TOUCHES and (close_inside if require_last_close_inside else True)
+        rows.append({
+            "Strumento": label,
+            "Ticker": ticker,
+            "Zona #": idx,
+            "Area attiva": "SI" if active else "NO",
+            "Ultimo Close": last_close,
+            "Balance": z.center,
+            "Zona min": z.center - z.half,
+            "Zona max": z.center + z.half,
+            "Tocchi ultime 3 chiuse": f"{touch_count}/3" if len(last3) == 3 else str(touch_count),
+            "Ultimo Close dentro": "SI" if close_inside else "NO",
+            "H": z.hits,
+            "Strength": z.strength,
+            "Test indipendenti": z.independent_tests,
+            "Successi indipendenti": z.independent_successes,
+            "Break indipendenti": z.independent_breaks,
+            "Reliability %": z.reliability,
+            "Support H": z.support_hits,
+            "Resistance H": z.resistance_hits,
+            "Dwell": z.dwell,
+            "Last Hit Age": z.last_hit_age,
+        })
+    return rows
+
+
+# =============================================================================
+# CHART / EXCEL
+# =============================================================================
+def plot_balance(data: pd.DataFrame, balance: dict[str, Any], ticker: str, active_center: float) -> go.Figure:
+    chart = data.tail(220)
     fig = go.Figure(data=[go.Candlestick(
         x=chart.index,
         open=chart["open"], high=chart["high"], low=chart["low"], close=chart["close"],
         name=ticker,
     )])
     for z in balance.get("zones", []):
-        role = balance_role(z, close)
-        if role == "SUPPORTO":
-            fill = "rgba(0,170,110,0.16)"
-            line = "rgba(0,150,95,0.95)"
-        elif role == "RESISTENZA":
-            fill = "rgba(255,120,40,0.15)"
-            line = "rgba(255,105,35,0.95)"
-        else:
-            fill = "rgba(80,150,255,0.13)"
-            line = "rgba(70,135,235,0.90)"
+        selected = abs(z.center - active_center) <= max(1e-12, z.half * 0.05)
+        fill = "rgba(255,215,0,0.28)" if selected else "rgba(120,120,120,0.10)"
+        line = "rgba(220,170,0,1.0)" if selected else "rgba(120,120,120,0.65)"
+        width = 2 if selected else 1
         fig.add_hrect(y0=z.center - z.half, y1=z.center + z.half, fillcolor=fill, line_width=0)
-        fig.add_hline(y=z.center, line_width=1, line_color=line)
+        fig.add_hline(y=z.center, line_width=width, line_color=line)
     fig.update_layout(
-        title=f"{ticker} · {timeframe} · Balance V3",
+        title=f"{ticker} · Daily chiusa · Balance attiva evidenziata",
         height=650,
         xaxis_rangeslider_visible=False,
         margin=dict(l=20, r=20, t=55, b=20),
@@ -595,48 +607,40 @@ def plot_balance(data: pd.DataFrame, balance: dict[str, Any], ticker: str, timef
     return fig
 
 
-def excel_bytes(summary: pd.DataFrame, zones: pd.DataFrame, errors: list[dict[str, str]]) -> bytes:
+def excel_bytes(active: pd.DataFrame, all_zones: pd.DataFrame, errors: list[dict[str, str]]) -> bytes:
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        summary.to_excel(writer, sheet_name="Riepilogo", index=False)
-        zones.to_excel(writer, sheet_name="Zone Balance", index=False)
+        active.to_excel(writer, sheet_name="Aree attive", index=False)
+        all_zones.to_excel(writer, sheet_name="Tutte le Balance", index=False)
         if errors:
             pd.DataFrame(errors).to_excel(writer, sheet_name="Errori", index=False)
+
         wb = writer.book
-        head = wb.add_format({"bold": True, "bg_color": "#1F4E78", "font_color": "#FFFFFF", "border": 1, "align": "center"})
+        header = wb.add_format({"bold": True, "bg_color": "#1F4E78", "font_color": "#FFFFFF", "border": 1, "align": "center"})
         n4 = wb.add_format({"num_format": "0.0000"})
         n2 = wb.add_format({"num_format": "0.00"})
-        for name, df in [("Riepilogo", summary), ("Zone Balance", zones)]:
+        active_fmt = wb.add_format({"bg_color": "#FFF2CC", "bold": True})
+
+        for name, df in [("Aree attive", active), ("Tutte le Balance", all_zones)]:
             ws = writer.sheets[name]
             ws.freeze_panes(1, 0)
-            ws.autofilter(0, 0, max(0, len(df)), max(0, len(df.columns) - 1))
-            ws.set_row(0, 24, head)
+            if len(df.columns):
+                ws.autofilter(0, 0, max(0, len(df)), len(df.columns) - 1)
+            ws.set_row(0, 24, header)
             for j, col in enumerate(df.columns):
-                width = min(30, max(12, len(str(col)) + 2))
+                width = min(28, max(11, len(str(col)) + 2))
+                if col in {"Strumento", "Ticker", "Area", "Tocchi ultime 3 chiuse"}:
+                    width = max(width, 16)
                 fmt = None
-                if col in {"Prezzo", "Supporto 1", "Supporto 2", "Supporto 3", "Resistenza 1", "Resistenza 2", "Resistenza 3", "Balance corrente", "Balance più vicina", "Centro", "Zona min", "Zona max"}:
+                if col in {"Ultimo Close", "Balance", "Zona min", "Zona max"}:
                     fmt = n4
-                elif "ATR" in col or col in {"Strength", "Reliability %"}:
+                elif col in {"Strength", "Reliability %"}:
                     fmt = n2
                 ws.set_column(j, j, width, fmt)
+            if len(df) and "Area attiva" in df.columns:
+                c = df.columns.get_loc("Area attiva")
+                ws.conditional_format(1, c, len(df), c, {"type": "text", "criteria": "containing", "value": "SI", "format": active_fmt})
     return out.getvalue()
-
-
-def default_universe() -> str:
-    return """# LABEL;TICKER Yahoo Finance
-British Pound;6B=F
-RTY;RTY=F
-YM;YM=F
-WTI;CL=F
-Silver;SI=F
-NQ;NQ=F
-ES;ES=F
-Gold;GC=F
-Copper;HG=F
-Japanese Yen;6J=F
-Euro FX;6E=F
-NatGas;NG=F
-"""
 
 
 # =============================================================================
@@ -644,16 +648,22 @@ NatGas;NG=F
 # =============================================================================
 with st.sidebar:
     st.header("Impostazioni")
-    timeframe = st.selectbox("Timeframe", ["Daily", "H4", "H1"], index=0)
-    mode = st.selectbox("Motore zone", ["Snapshot corrente", "Retention simulata"], index=0)
-    freeze_age = 0
-    if mode == "Retention simulata":
-        freeze_age = st.slider("Età ultimo aggiornamento zone (barre)", 0, 49, 0, 1)
-    st.divider()
+    market = st.selectbox("Mercato lista", ["Italia", "USA", "Misto / ticker Yahoo completi"], index=0)
+    adjusted = st.checkbox(
+        "Prezzi Yahoo adjusted",
+        value=False,
+        help="È una scelta della serie dati, non un filtro dello screener. Per confronti con TradingView usa la stessa impostazione di aggiustamento del grafico.",
+    )
+    require_last_close_inside = st.checkbox(
+        "Richiedi ultimo Close Daily dentro la Balance",
+        value=True,
+        help="ON: oltre ad almeno 2 tocchi reali nelle ultime 3 Daily chiuse, l'ultimo Close deve essere dentro la stessa fascia. OFF: bastano i 2 tocchi reali su 3.",
+    )
     uploaded = st.file_uploader("File ticker .txt", type=["txt", "csv"])
     use_manual = st.checkbox("Modifica/incolla ticker manualmente", value=uploaded is None)
-    manual_text = st.text_area("Ticker", default_universe(), height=260, disabled=not use_manual)
-    run = st.button("🔎 Calcola Balance", type="primary", use_container_width=True)
+    default_text = italy_example() if market == "Italia" else usa_example() if market == "USA" else "# Nome;Ticker Yahoo\n"
+    manual_text = st.text_area("Ticker", default_text, height=320, disabled=not use_manual)
+    run = st.button("🔎 Cerca aree Balance attive", type="primary", use_container_width=True)
 
 if uploaded is not None and not use_manual:
     try:
@@ -663,119 +673,125 @@ if uploaded is not None and not use_manual:
 else:
     text = manual_text
 
-universe = parse_tickers(text)
+universe = parse_tickers(text, market)
 
 if run:
     if not universe:
-        st.error("Nessun ticker valido.")
+        st.error("Nessun ticker valido nel file/elenco.")
         st.stop()
 
-    summary_rows: list[dict[str, Any]] = []
-    all_zone_rows: list[dict[str, Any]] = []
+    labels = {ticker: label for label, ticker in universe}
+    tickers = [ticker for _, ticker in universe]
+    data_map, notes = load_universe_data(tickers, adjusted=adjusted)
+
+    active_rows: list[dict[str, Any]] = []
+    all_rows: list[dict[str, Any]] = []
     details: dict[str, tuple[pd.DataFrame, dict[str, Any], str]] = {}
     errors: list[dict[str, str]] = []
-    progress = st.progress(0.0, text="Avvio…")
+    progress = st.progress(0.0, text="Avvio scansione…")
 
-    for i, (label, ticker) in enumerate(universe, start=1):
-        progress.progress((i - 1) / len(universe), text=f"{ticker} · Balance")
-        data, note = load_price_data(ticker, timeframe)
+    for i, ticker in enumerate(tickers, start=1):
+        progress.progress((i - 1) / len(tickers), text=f"{ticker} · Balance Daily")
+        data = data_map.get(ticker, pd.DataFrame())
+        data, _open_bar_removed = only_closed_daily(data, ticker, market)
         if data.empty or len(data) < 120:
-            errors.append({"Ticker": ticker, "Errore": note or "Dati insufficienti"})
+            errors.append({"Ticker": ticker, "Errore": notes.get(ticker, "Dati insufficienti")})
             continue
         try:
-            bal = analyze_balance_v3(data, mode=mode, lookback=400, update_frequency=50, freeze_age=int(freeze_age))
-            if not bal.get("available"):
-                errors.append({"Ticker": ticker, "Errore": str(bal.get("detail", "Balance non disponibili"))})
+            balance = analyze_balance_zones(data, lookback=LOOKBACK)
+            if not balance.get("available"):
+                errors.append({"Ticker": ticker, "Errore": str(balance.get("detail", "Balance non disponibili"))})
                 continue
-            summary_rows.append(summary_row(label, ticker, timeframe, bal, note))
-            all_zone_rows.extend(zone_rows(label, ticker, timeframe, bal))
-            details[ticker] = (data, bal, label)
+            active_rows.extend(active_zone_rows(labels[ticker], ticker, data, balance, require_last_close_inside))
+            all_rows.extend(all_balance_rows(labels[ticker], ticker, data, balance, require_last_close_inside))
+            details[ticker] = (data, balance, labels[ticker])
         except Exception as exc:
             errors.append({"Ticker": ticker, "Errore": f"{type(exc).__name__}: {exc}"})
 
     progress.progress(1.0, text="Completato")
-    st.session_state["balance_alignment_v3"] = {
-        "summary": summary_rows,
-        "zones": all_zone_rows,
+    st.session_state["balance_stock_active_v2_1"] = {
+        "active_rows": active_rows,
+        "all_rows": all_rows,
         "details": details,
         "errors": errors,
-        "timeframe": timeframe,
-        "mode": mode,
-        "freeze_age": int(freeze_age),
+        "adjusted": bool(adjusted),
+        "require_last_close_inside": bool(require_last_close_inside),
     }
 
-payload = st.session_state.get("balance_alignment_v3")
+payload = st.session_state.get("balance_stock_active_v2_1")
 if payload:
-    summary = pd.DataFrame(payload["summary"])
-    zones = pd.DataFrame(payload["zones"])
+    active_rows = payload["active_rows"]
+    all_rows = payload["all_rows"]
     details = payload["details"]
     errors = payload["errors"]
-    scan_tf = payload["timeframe"]
-    scan_mode = payload["mode"]
 
-    if summary.empty:
-        st.warning("Nessun risultato disponibile.")
-        if errors:
-            st.dataframe(pd.DataFrame(errors), hide_index=True, use_container_width=True)
-        st.stop()
+    active = pd.DataFrame(active_rows)
+    all_zones = pd.DataFrame(all_rows)
 
-    if scan_tf != timeframe or scan_mode != mode:
-        st.warning("Le impostazioni sono cambiate. Premi ‘Calcola Balance’ per aggiornare i risultati.")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Titoli con Balance calcolate", len(details))
+    c2.metric("Aree attive · Daily chiuse", len(active))
+    c3.metric("Ticker senza risultato", len(errors))
 
-    st.subheader("Allineamento Balance")
-    display_cols = [
-        "Strumento", "Ticker", "TF", "Prezzo",
-        "Supporto 3", "Supporto 2", "Supporto 1",
-        "Balance corrente",
-        "Resistenza 1", "Resistenza 2", "Resistenza 3",
-        "Dentro Balance", "Balance più vicina", "Dist. centro ATR",
-        "N. Balance", "Data livelli", "Età livelli barre", "Modalità",
-    ]
-    st.dataframe(
-        summary[display_cols],
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Prezzo": st.column_config.NumberColumn("Prezzo", format="%.4f"),
-            "Supporto 1": st.column_config.NumberColumn("Supporto 1", format="%.4f"),
-            "Supporto 2": st.column_config.NumberColumn("Supporto 2", format="%.4f"),
-            "Supporto 3": st.column_config.NumberColumn("Supporto 3", format="%.4f"),
-            "Resistenza 1": st.column_config.NumberColumn("Resistenza 1", format="%.4f"),
-            "Resistenza 2": st.column_config.NumberColumn("Resistenza 2", format="%.4f"),
-            "Resistenza 3": st.column_config.NumberColumn("Resistenza 3", format="%.4f"),
-            "Balance corrente": st.column_config.NumberColumn("Balance corrente", format="%.4f"),
-            "Balance più vicina": st.column_config.NumberColumn("Balance più vicina", format="%.4f"),
-            "Dist. centro ATR": st.column_config.NumberColumn("Dist. centro ATR", format="%.2f"),
-        },
-    )
+    st.subheader("Aree Balance attive")
+    if active.empty:
+        rule = "2 tocchi reali nelle ultime 3 Daily chiuse" + (" + ultimo Close dentro la Balance" if payload.get("require_last_close_inside", True) else "")
+        st.info(f"Nessuna AREA ATTIVA con la regola selezionata: {rule}.")
+    else:
+        active["_touch_num"] = active["Tocchi ultime 3 chiuse"].str.extract(r"(\d+)")[0].astype(int)
+        active = active.sort_values(["_touch_num", "Strength", "Strumento"], ascending=[False, False, True]).reset_index(drop=True)
+        visible = [
+            "Strumento", "Ticker", "Area", "Ultimo Close", "Balance", "Zona min", "Zona max",
+            "Tocchi ultime 3 chiuse", "Tocco -2", "Tocco -1", "Tocco 0", "Ultimo Close dentro",
+            "H", "Strength", "Test indipendenti", "Successi indipendenti", "Break indipendenti", "Reliability %",
+            "Data ultima Daily chiusa",
+        ]
+        st.dataframe(
+            active[visible],
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Ultimo Close": st.column_config.NumberColumn("Ultimo Close", format="%.4f"),
+                "Balance": st.column_config.NumberColumn("Balance", format="%.4f"),
+                "Zona min": st.column_config.NumberColumn("Zona min", format="%.4f"),
+                "Zona max": st.column_config.NumberColumn("Zona max", format="%.4f"),
+                "Strength": st.column_config.NumberColumn("Strength", format="%.1f"),
+                "Reliability %": st.column_config.NumberColumn("Reliability %", format="%.1f"),
+            },
+        )
 
-    xlsx = excel_bytes(summary, zones, errors)
+    active_export = active.drop(columns=["_zone_index", "_touch_num", "_select"], errors="ignore") if not active.empty else pd.DataFrame(columns=[
+        "Strumento", "Ticker", "Area", "Ultimo Close", "Balance", "Zona min", "Zona max", "Tocchi ultime 3 chiuse",
+        "Ultimo Close dentro", "H", "Strength", "Test indipendenti", "Successi indipendenti", "Break indipendenti", "Reliability %"
+    ])
+    all_export = all_zones.copy()
+    xlsx = excel_bytes(active_export, all_export, errors)
     st.download_button(
         "⬇️ Esporta Excel",
         data=xlsx,
-        file_name=f"balance_alignment_v3_{scan_tf}.xlsx",
+        file_name="balance_stock_active_daily_closed.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    st.subheader("Verifica grafica")
-    selected = st.selectbox("Strumento", summary["Ticker"].tolist(), key="balance_alignment_chart_v3")
-    data, bal, label = details[selected]
-    st.plotly_chart(plot_balance(data, bal, selected, scan_tf), use_container_width=True)
+    if not active.empty:
+        st.subheader("Verifica grafica")
+        active["_select"] = active["Ticker"].astype(str) + " | " + active["Balance"].map(lambda x: f"{x:.4f}")
+        selected_key = st.selectbox("Area attiva", active["_select"].tolist(), key="balance_stock_active_chart")
+        selected_row = active[active["_select"] == selected_key].iloc[0]
+        ticker = str(selected_row["Ticker"])
+        data, balance, _ = details[ticker]
+        st.plotly_chart(plot_balance(data, balance, ticker, float(selected_row["Balance"])), use_container_width=True)
+        a, b, c, d = st.columns(4)
+        a.metric("Ultimo Close", f"{float(selected_row['Ultimo Close']):.4f}")
+        b.metric("Balance", f"{float(selected_row['Balance']):.4f}")
+        c.metric("Tocchi ultime 3 chiuse", str(selected_row["Tocchi ultime 3 chiuse"]))
+        d.metric("Reliability", "n/d" if pd.isna(selected_row["Reliability %"]) else f"{float(selected_row['Reliability %']):.0f}%")
 
-    zdf = zones[zones["Ticker"] == selected].copy().reset_index(drop=True)
-    st.dataframe(
-        zdf[["Ordine prezzo", "Ruolo", "Centro", "Zona min", "Zona max", "Distanza ATR", "Strength", "Hits", "Reliability %", "Test indipendenti"]],
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Centro": st.column_config.NumberColumn("Centro", format="%.4f"),
-            "Zona min": st.column_config.NumberColumn("Zona min", format="%.4f"),
-            "Zona max": st.column_config.NumberColumn("Zona max", format="%.4f"),
-            "Distanza ATR": st.column_config.NumberColumn("Distanza ATR", format="%.2f"),
-            "Strength": st.column_config.NumberColumn("Strength", format="%.1f"),
-            "Reliability %": st.column_config.NumberColumn("Reliability %", format="%.1f"),
-        },
-    )
+    with st.expander("Tutte le Balance calcolate"):
+        if all_zones.empty:
+            st.info("Nessuna Balance disponibile.")
+        else:
+            st.dataframe(all_zones, hide_index=True, use_container_width=True)
 
     if errors:
         with st.expander(f"Ticker senza risultato ({len(errors)})"):

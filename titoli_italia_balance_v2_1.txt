@@ -1,0 +1,40 @@
+# Nome;Ticker
+A2A;A2A
+Amplifon;AMP
+Azimut;AZM
+Banco BPM;BAMI
+Brunello Cucinelli;BC
+Banca Generali;BGN
+MPS;BMPS
+BPER Banca;BPE
+Buzzi;BZU
+Campari;CPR
+DiaSorin;DIA
+Enel;ENEL
+Eni;ENI
+ERG;ERG
+Fineco;FBK
+Generali;G
+Hera;HER
+Inwit;INW
+Intesa Sanpaolo;ISP
+Iveco;IVG
+Leonardo;LDO
+Mediobanca;MB
+Moncler;MONC
+Nexi;NEXI
+Pirelli;PIRC
+Prysmian;PRY
+Poste Italiane;PST
+Ferrari;RACE
+Recordati;REC
+Ferragamo;SFER
+Saipem;SPM
+Snam;SRG
+Stellantis;STLAM
+STM;STMMI
+Tenaris;TEN
+Telecom Italia;TIT
+Terna;TRN
+UniCredit;UCG
+Unipol;UNI
