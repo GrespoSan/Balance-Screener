@@ -18,8 +18,8 @@ import yfinance as yf
 # =============================================================================
 # PAGE
 # =============================================================================
-st.set_page_config(page_title="G. Balance Stock Active V2.1", page_icon="🎯", layout="wide")
-st.title("🎯 G. Balance Stock Active V2.1 — Daily chiusa")
+st.set_page_config(page_title="G. Balance Stock Active V2.2", page_icon="🎯", layout="wide")
+st.title("🎯 G. Balance Stock Active V2.2 — Daily chiusa")
 
 LOOKBACK = 500
 LAST_TOUCH_BARS = 3
@@ -65,23 +65,56 @@ def normalize_stock_ticker(ticker: str, market: str) -> str:
 
 
 def parse_tickers(text: str, market: str) -> list[tuple[str, str]]:
+    """
+    Formati accettati:
+    - lista separata da virgole, anche su una sola riga: ENI.MI, UCG.MI, ISP.MI
+    - un ticker per riga
+    - Nome;Ticker (oppure Nome<TAB>Ticker)
+
+    La virgola viene sempre interpretata come separatore di una LISTA di ticker,
+    non come coppia Nome,Ticker. Questo mantiene compatibilita con i file usati
+    dagli altri screener Python dell'utente.
+    """
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = [p.strip() for p in re.split(r"[;,\t]", line) if p.strip()]
-        if not parts:
-            continue
-        if len(parts) >= 2:
-            label, raw_ticker = parts[0], parts[-1]
-        else:
-            label, raw_ticker = parts[0], parts[0]
+    ignored_headers = {"TICKER", "TICKERS", "SYMBOL", "SYMBOLS", "SIMBOLO", "SIMBOLI"}
+
+    def add_item(label: str, raw_ticker: str) -> None:
+        raw_ticker = raw_ticker.strip().strip('"').strip("'")
+        label_clean = label.strip().strip('"').strip("'")
+        if not raw_ticker or raw_ticker.upper() in ignored_headers:
+            return
         ticker = normalize_stock_ticker(raw_ticker, market)
         if ticker and ticker not in seen:
-            out.append((label, ticker))
+            out.append((label_clean or raw_ticker, ticker))
             seen.add(ticker)
+
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+
+        # Formato descrittivo: Nome;Ticker oppure Nome<TAB>Ticker.
+        # Il punto e virgola NON viene usato per dividere una lista di ticker.
+        if ";" in line or "\t" in line:
+            parts = [p.strip() for p in re.split(r"[;\t]", line) if p.strip()]
+            if len(parts) >= 2:
+                add_item(parts[0], parts[-1])
+            elif parts:
+                add_item(parts[0], parts[0])
+            continue
+
+        # Formato lista degli screener esistenti: ticker separati da virgole.
+        if "," in line:
+            for token in line.split(","):
+                token = token.strip()
+                if token:
+                    add_item(token, token)
+            continue
+
+        # Un ticker per riga.
+        add_item(line, line)
+
     return out
 
 
@@ -675,6 +708,15 @@ else:
 
 universe = parse_tickers(text, market)
 
+with st.sidebar:
+    if text.strip():
+        st.caption(f"Ticker riconosciuti: **{len(universe)}**")
+        if universe:
+            preview = ", ".join(t for _, t in universe[:8])
+            if len(universe) > 8:
+                preview += ", …"
+            st.caption(f"Anteprima: {preview}")
+
 if run:
     if not universe:
         st.error("Nessun ticker valido nel file/elenco.")
@@ -709,7 +751,7 @@ if run:
             errors.append({"Ticker": ticker, "Errore": f"{type(exc).__name__}: {exc}"})
 
     progress.progress(1.0, text="Completato")
-    st.session_state["balance_stock_active_v2_1"] = {
+    st.session_state["balance_stock_active_v2_2"] = {
         "active_rows": active_rows,
         "all_rows": all_rows,
         "details": details,
@@ -718,7 +760,7 @@ if run:
         "require_last_close_inside": bool(require_last_close_inside),
     }
 
-payload = st.session_state.get("balance_stock_active_v2_1")
+payload = st.session_state.get("balance_stock_active_v2_2")
 if payload:
     active_rows = payload["active_rows"]
     all_rows = payload["all_rows"]
