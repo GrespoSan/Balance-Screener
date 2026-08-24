@@ -5,6 +5,7 @@ from typing import Any
 import io
 import math
 import re
+import hashlib
 from datetime import time
 from zoneinfo import ZoneInfo
 
@@ -18,12 +19,12 @@ import yfinance as yf
 # =============================================================================
 # PAGE
 # =============================================================================
-st.set_page_config(page_title="G. Balance Stock Screener", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="G. Balance Stock screener", page_icon="🎯", layout="wide")
 st.title("🎯 G. Balance Stock Screener")
 
 LOOKBACK = 500
-LAST_TOUCH_BARS = 3
-MIN_TOUCHES = 2
+LAST_TOUCH_BARS = 5
+DEFAULT_MIN_TOUCHES = 2
 
 
 # =============================================================================
@@ -268,18 +269,27 @@ def download_daily_chunk(tickers: tuple[str, ...], adjusted: bool) -> dict[str, 
         actions=False,
         group_by="ticker",
         progress=False,
-        threads=True,
+        threads=8,
+        timeout=15,
     )
     single = len(tickers) == 1
     return {t: _extract_from_batch(raw, t, single) for t in tickers}
 
 
-def load_universe_data(tickers: list[str], adjusted: bool) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+def load_universe_data(
+    tickers: list[str], adjusted: bool, progress: Any | None = None
+) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
     data_map: dict[str, pd.DataFrame] = {}
     notes: dict[str, str] = {}
-    chunk_size = 40
-    for start in range(0, len(tickers), chunk_size):
+    # Blocchi più ampi: meno overhead Streamlit/yfinance. yfinance limita comunque
+    # il parallelismo interno tramite threads.
+    chunk_size = 80
+    total_chunks = max(1, math.ceil(len(tickers) / chunk_size))
+    for chunk_no, start in enumerate(range(0, len(tickers), chunk_size), start=1):
         chunk = tuple(tickers[start:start + chunk_size])
+        if progress is not None:
+            frac = 0.05 + 0.30 * ((chunk_no - 1) / total_chunks)
+            progress.progress(min(frac, 0.34), text=f"Download Yahoo {chunk_no}/{total_chunks} · {len(chunk)} ticker")
         try:
             result = download_daily_chunk(chunk, adjusted)
         except Exception as exc:
@@ -293,8 +303,9 @@ def load_universe_data(tickers: list[str], adjusted: bool) -> tuple[dict[str, pd
                 continue
             data_map[t] = df
             notes[t] = "Dati Daily acquisiti."
+    if progress is not None:
+        progress.progress(0.35, text=f"Download completato · {len(data_map)}/{len(tickers)} ticker con dati")
     return data_map, notes
-
 
 def _market_clock_for_ticker(ticker: str, market: str) -> tuple[str, time]:
     """Restituisce timezone e chiusura regolare per decidere se la Daily odierna è ancora aperta."""
@@ -353,13 +364,16 @@ def _future_close_extremes(close: np.ndarray, validation_bars: int) -> tuple[np.
 
 
 def _balance_eval_compatible(
-    daily: pd.DataFrame, center: float, half: float, scan_limit: int, validation_bars: int = 10
+    daily: pd.DataFrame, center: float, half: float, scan_limit: int, validation_bars: int = 10,
+    future_min: np.ndarray | None = None, future_max: np.ndarray | None = None,
 ) -> tuple[int, int, int, int, int, float]:
-    # Implementazione vettoriale equivalente alle stesse definizioni del motore originale.
+    # Stesse definizioni del motore originale. Le finestre future vengono
+    # precalcolate una sola volta per simbolo per velocizzare universi ampi.
     lows = daily["low"].to_numpy(float)
     highs = daily["high"].to_numpy(float)
     closes = daily["close"].to_numpy(float)
-    future_min, future_max = _future_close_extremes(closes, validation_bars)
+    if future_min is None or future_max is None:
+        future_min, future_max = _future_close_extremes(closes, validation_bars)
 
     current = len(closes) - 1
     first_offset = validation_bars + 1
@@ -375,19 +389,19 @@ def _balance_eval_compatible(
     if not np.any(overlap):
         return 0, 0, 0, 0, 99999, 0.0
 
-    p = pos[overlap]
-    is_support = closes[p] >= center
-    broken_support = future_min[p] < bottom
-    broken_resistance = future_max[p] > top
+    pp = pos[overlap]
+    is_support = closes[pp] >= center
+    broken_support = future_min[pp] < bottom
+    broken_resistance = future_max[pp] > top
     valid_support = is_support & (~broken_support)
     valid_resistance = (~is_support) & (~broken_resistance)
 
     support_hits = int(np.sum(valid_support))
     resistance_hits = int(np.sum(valid_resistance))
-    dwell = int(len(p))
+    dwell = int(len(pp))
     hits = support_hits + resistance_hits
     valid_any = valid_support | valid_resistance
-    nearest_age = int(np.min(current - p[valid_any])) if np.any(valid_any) else 99999
+    nearest_age = int(np.min(current - pp[valid_any])) if np.any(valid_any) else 99999
 
     hit_score = 1.0 - math.exp(-hits / 18.0)
     dwell_score = 1.0 - math.exp(-dwell / 45.0)
@@ -397,7 +411,6 @@ def _balance_eval_compatible(
     strength = 100.0 * (0.50 * hit_score + 0.15 * dwell_score + 0.12 * role_mix + 0.13 * freshness + 0.10 * density)
     strength = max(0.0, min(100.0, strength))
     return support_hits, resistance_hits, hits, dwell, nearest_age, strength
-
 
 def _balance_eval_independent(
     daily: pd.DataFrame, atr: pd.Series, center: float, half: float, scan_limit: int,
@@ -491,26 +504,29 @@ def analyze_balance_zones(
         return unavailable
 
     half = max(1e-12, atr_now * float(zone_half_atr))
-    candidates: list[tuple[float, float, int]] = []
+    closes_arr = data["close"].to_numpy(float)
+    future_min, future_max = _future_close_extremes(closes_arr, 10)
+    candidates: list[tuple[float, float, int, int, int, int, int]] = []
     steps = int(round(100.0 / float(scan_step_pct)))
-    for s in range(steps + 1):
-        pct = min(100.0, s * float(scan_step_pct))
+    for step_idx in range(steps + 1):
+        pct = min(100.0, step_idx * float(scan_step_pct))
         center = range_low + active_range * pct / 100.0
-        sup, res, hits, dwell, age, strength = _balance_eval_compatible(data, center, half, scan_limit)
+        sup, res, hits, dwell, age, strength = _balance_eval_compatible(
+            data, center, half, scan_limit, future_min=future_min, future_max=future_max
+        )
         if hits >= 1:
-            candidates.append((center, strength, hits))
+            candidates.append((center, strength, hits, sup, res, dwell, age))
 
     if not candidates:
         return {**unavailable, "detail": "Nessuna Balance qualificata nel lookback corrente."}
 
     spacing = active_range * float(min_spacing_range_pct) / 100.0
     selected: list[BalanceZone] = []
-    for center, _, _ in sorted(candidates, key=lambda x: x[1], reverse=True):
+    for center, strength, hits, sup, res, dwell, age in sorted(candidates, key=lambda x: x[1], reverse=True):
         if len(selected) >= int(max_zones):
             break
         if any(abs(center - z.center) < spacing for z in selected):
             continue
-        sup, res, hits, dwell, age, strength = _balance_eval_compatible(data, center, half, scan_limit)
         tests, succ, ind_sup, ind_res, brk, rel = _balance_eval_independent(data, atr, center, half, scan_limit)
         selected.append(BalanceZone(
             center=center,
@@ -559,22 +575,22 @@ def price_inside_zone(price: float, z: BalanceZone) -> bool:
 
 
 def active_zone_rows(
-    label: str, ticker: str, data: pd.DataFrame, balance: dict[str, Any], require_last_close_inside: bool
+    label: str, ticker: str, data: pd.DataFrame, balance: dict[str, Any], require_last_close_inside: bool, min_touches: int
 ) -> list[dict[str, Any]]:
     if data.empty or len(data) < LAST_TOUCH_BARS:
         return []
 
-    last3 = data.iloc[-LAST_TOUCH_BARS:]
+    recent = data.iloc[-LAST_TOUCH_BARS:]
     last_closed = data.iloc[-1]
     last_close = float(last_closed["close"])
     last_date = pd.Timestamp(data.index[-1])
     rows: list[dict[str, Any]] = []
 
     for idx, z in enumerate(balance.get("zones", []), start=1):
-        touches = [candle_touches_zone(last3.iloc[i], z) for i in range(LAST_TOUCH_BARS)]
+        touches = [candle_touches_zone(recent.iloc[i], z) for i in range(LAST_TOUCH_BARS)]
         touch_count = int(sum(touches))
         close_inside = price_inside_zone(last_close, z)
-        active = touch_count >= MIN_TOUCHES and (close_inside if require_last_close_inside else True)
+        active = touch_count >= int(min_touches) and (close_inside if require_last_close_inside else True)
         if not active:
             continue
 
@@ -586,10 +602,12 @@ def active_zone_rows(
             "Balance": z.center,
             "Zona min": z.center - z.half,
             "Zona max": z.center + z.half,
-            "Tocchi ultime 3 chiuse": f"{touch_count}/3",
-            "Tocco -2": "SI" if touches[0] else "NO",
-            "Tocco -1": "SI" if touches[1] else "NO",
-            "Tocco 0": "SI" if touches[2] else "NO",
+            "Tocchi ultime 5 chiuse": f"{touch_count}/5",
+            "Tocco -4": "SI" if touches[0] else "NO",
+            "Tocco -3": "SI" if touches[1] else "NO",
+            "Tocco -2": "SI" if touches[2] else "NO",
+            "Tocco -1": "SI" if touches[3] else "NO",
+            "Tocco 0": "SI" if touches[4] else "NO",
             "Ultimo Close dentro": "SI" if close_inside else "NO",
             "H": z.hits,
             "Strength": z.strength,
@@ -608,18 +626,18 @@ def active_zone_rows(
 
 
 def all_balance_rows(
-    label: str, ticker: str, data: pd.DataFrame, balance: dict[str, Any], require_last_close_inside: bool
+    label: str, ticker: str, data: pd.DataFrame, balance: dict[str, Any], require_last_close_inside: bool, min_touches: int
 ) -> list[dict[str, Any]]:
     if data.empty:
         return []
     last_close = float(data.iloc[-1]["close"])
-    last3 = data.iloc[-min(LAST_TOUCH_BARS, len(data)):]
+    recent = data.iloc[-min(LAST_TOUCH_BARS, len(data)):]
     rows: list[dict[str, Any]] = []
     for idx, z in enumerate(balance.get("zones", []), start=1):
-        touches = [candle_touches_zone(last3.iloc[i], z) for i in range(len(last3))]
+        touches = [candle_touches_zone(recent.iloc[i], z) for i in range(len(recent))]
         touch_count = int(sum(touches))
         close_inside = price_inside_zone(last_close, z)
-        active = len(last3) == LAST_TOUCH_BARS and touch_count >= MIN_TOUCHES and (close_inside if require_last_close_inside else True)
+        active = len(recent) == LAST_TOUCH_BARS and touch_count >= int(min_touches) and (close_inside if require_last_close_inside else True)
         rows.append({
             "Strumento": label,
             "Ticker": ticker,
@@ -629,7 +647,7 @@ def all_balance_rows(
             "Balance": z.center,
             "Zona min": z.center - z.half,
             "Zona max": z.center + z.half,
-            "Tocchi ultime 3 chiuse": f"{touch_count}/3" if len(last3) == 3 else str(touch_count),
+            "Tocchi ultime 5 chiuse": f"{touch_count}/5" if len(recent) == 5 else str(touch_count),
             "Ultimo Close dentro": "SI" if close_inside else "NO",
             "H": z.hits,
             "Strength": z.strength,
@@ -693,7 +711,7 @@ def excel_bytes(active: pd.DataFrame, all_zones: pd.DataFrame, errors: list[dict
             ws.set_row(0, 24, header)
             for j, col in enumerate(df.columns):
                 width = min(28, max(11, len(str(col)) + 2))
-                if col in {"Strumento", "Ticker", "Area", "Tocchi ultime 3 chiuse"}:
+                if col in {"Strumento", "Ticker", "Area", "Tocchi ultime 5 chiuse"}:
                     width = max(width, 16)
                 fmt = None
                 if col in {"Ultimo Close", "Balance", "Zona min", "Zona max"}:
@@ -705,6 +723,11 @@ def excel_bytes(active: pd.DataFrame, all_zones: pd.DataFrame, errors: list[dict
                 c = df.columns.get_loc("Area attiva")
                 ws.conditional_format(1, c, len(df), c, {"type": "text", "criteria": "containing", "value": "SI", "format": active_fmt})
     return out.getvalue()
+
+
+def scan_signature(universe: list[tuple[str, str]], market: str, adjusted: bool, require_last_close_inside: bool, min_touches: int) -> str:
+    raw = "|".join([market, str(bool(adjusted)), str(bool(require_last_close_inside)), str(int(min_touches))] + [t for _, t in universe])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 # =============================================================================
@@ -726,7 +749,15 @@ with st.sidebar:
     require_last_close_inside = st.checkbox(
         "Richiedi ultimo Close Daily dentro la Balance",
         value=False,
-        help="ON: oltre ad almeno 2 tocchi reali nelle ultime 3 Daily chiuse, l'ultimo Close deve essere dentro la stessa fascia. OFF: bastano i 2 tocchi reali su 3.",
+        help="ON: oltre al numero minimo di tocchi reali nelle ultime 5 Daily chiuse, l'ultimo Close deve essere dentro la stessa fascia.",
+    )
+    min_touches = st.number_input(
+        "Tocchi minimi",
+        min_value=1,
+        max_value=5,
+        value=DEFAULT_MIN_TOUCHES,
+        step=1,
+        help="Numero minimo di Daily chiuse, tra le ultime 5, che devono intersecare realmente la stessa Balance.",
     )
     uploaded = st.file_uploader("File ticker .txt", type=["txt", "csv"])
     use_manual = st.checkbox("Modifica/incolla ticker manualmente", value=uploaded is None)
@@ -754,6 +785,7 @@ else:
 
 market = infer_market_from_text(text, source_name) if market_choice == "Automatico" else market_choice
 universe = parse_tickers(text, market)
+current_signature = scan_signature(universe, market, adjusted, require_last_close_inside, int(min_touches))
 
 with st.sidebar:
     if text.strip():
@@ -771,18 +803,22 @@ if run:
         st.error("Nessun ticker valido nel file/elenco.")
         st.stop()
 
+    # Elimina subito il risultato precedente: durante una scansione USA non deve
+    # restare visibile la vecchia tabella italiana.
+    st.session_state.pop("balance_stock_screener_v2_6", None)
+
     labels = {ticker: label for label, ticker in universe}
     tickers = [ticker for _, ticker in universe]
-    data_map, notes = load_universe_data(tickers, adjusted=adjusted)
+    progress = st.progress(0.0, text="Avvio scansione…")
+    data_map, notes = load_universe_data(tickers, adjusted=adjusted, progress=progress)
 
     active_rows: list[dict[str, Any]] = []
     all_rows: list[dict[str, Any]] = []
     details: dict[str, tuple[pd.DataFrame, dict[str, Any], str]] = {}
     errors: list[dict[str, str]] = []
-    progress = st.progress(0.0, text="Avvio scansione…")
 
     for i, ticker in enumerate(tickers, start=1):
-        progress.progress((i - 1) / len(tickers), text=f"{ticker} · Balance Daily")
+        progress.progress(0.35 + 0.65 * ((i - 1) / len(tickers)), text=f"Balance {i}/{len(tickers)} · {ticker}")
         data = data_map.get(ticker, pd.DataFrame())
         data, _open_bar_removed = only_closed_daily(data, ticker, market)
         if data.empty or len(data) < 120:
@@ -793,24 +829,28 @@ if run:
             if not balance.get("available"):
                 errors.append({"Ticker": ticker, "Errore": str(balance.get("detail", "Balance non disponibili"))})
                 continue
-            active_rows.extend(active_zone_rows(labels[ticker], ticker, data, balance, require_last_close_inside))
-            all_rows.extend(all_balance_rows(labels[ticker], ticker, data, balance, require_last_close_inside))
+            active_rows.extend(active_zone_rows(labels[ticker], ticker, data, balance, require_last_close_inside, int(min_touches)))
+            all_rows.extend(all_balance_rows(labels[ticker], ticker, data, balance, require_last_close_inside, int(min_touches)))
             details[ticker] = (data, balance, labels[ticker])
         except Exception as exc:
             errors.append({"Ticker": ticker, "Errore": f"{type(exc).__name__}: {exc}"})
 
     progress.progress(1.0, text="Completato")
-    st.session_state["balance_stock_active_v2_2"] = {
+    st.session_state["balance_stock_screener_v2_6"] = {
+        "signature": current_signature,
         "active_rows": active_rows,
         "all_rows": all_rows,
         "details": details,
         "errors": errors,
         "adjusted": bool(adjusted),
         "require_last_close_inside": bool(require_last_close_inside),
+        "min_touches": int(min_touches),
+        "total_tickers": len(tickers),
+        "downloaded_tickers": len(data_map),
     }
 
-payload = st.session_state.get("balance_stock_active_v2_2")
-if payload:
+payload = st.session_state.get("balance_stock_screener_v2_6")
+if payload and payload.get("signature") == current_signature:
     active_rows = payload["active_rows"]
     all_rows = payload["all_rows"]
     details = payload["details"]
@@ -824,16 +864,24 @@ if payload:
     c2.metric("Aree attive · Daily chiuse", len(active))
     c3.metric("Ticker senza risultato", len(errors))
 
+    total_tickers = int(payload.get("total_tickers", len(details) + len(errors)))
+    downloaded_tickers = int(payload.get("downloaded_tickers", len(details)))
+    if total_tickers >= 100 and downloaded_tickers < total_tickers * 0.80:
+        st.error(
+            f"Scansione incompleta: Yahoo Finance ha restituito dati per {downloaded_tickers}/{total_tickers} ticker. "
+            "I risultati sotto non rappresentano l'intero universo; controlla la sezione Ticker senza risultato e riprova dopo alcuni minuti."
+        )
+
     st.subheader("Aree Balance attive")
     if active.empty:
-        rule = "2 tocchi reali nelle ultime 3 Daily chiuse" + (" + ultimo Close dentro la Balance" if payload.get("require_last_close_inside", True) else "")
+        rule = f"almeno {int(payload.get('min_touches', DEFAULT_MIN_TOUCHES))} tocchi reali nelle ultime 5 Daily chiuse" + (" + ultimo Close dentro la Balance" if payload.get("require_last_close_inside", False) else "")
         st.info(f"Nessuna AREA ATTIVA con la regola selezionata: {rule}.")
     else:
-        active["_touch_num"] = active["Tocchi ultime 3 chiuse"].str.extract(r"(\d+)")[0].astype(int)
+        active["_touch_num"] = active["Tocchi ultime 5 chiuse"].str.extract(r"(\d+)")[0].astype(int)
         active = active.sort_values(["_touch_num", "Strength", "Strumento"], ascending=[False, False, True]).reset_index(drop=True)
         visible = [
             "Strumento", "Ticker", "Area", "Ultimo Close", "Balance", "Zona min", "Zona max",
-            "Tocchi ultime 3 chiuse", "Tocco -2", "Tocco -1", "Tocco 0", "Ultimo Close dentro",
+            "Tocchi ultime 5 chiuse", "Tocco -4", "Tocco -3", "Tocco -2", "Tocco -1", "Tocco 0", "Ultimo Close dentro",
             "H", "Strength", "Test indipendenti", "Successi indipendenti", "Break indipendenti", "Reliability %",
             "Data ultima Daily chiusa",
         ]
@@ -852,7 +900,7 @@ if payload:
         )
 
     active_export = active.drop(columns=["_zone_index", "_touch_num", "_select"], errors="ignore") if not active.empty else pd.DataFrame(columns=[
-        "Strumento", "Ticker", "Area", "Ultimo Close", "Balance", "Zona min", "Zona max", "Tocchi ultime 3 chiuse",
+        "Strumento", "Ticker", "Area", "Ultimo Close", "Balance", "Zona min", "Zona max", "Tocchi ultime 5 chiuse",
         "Ultimo Close dentro", "H", "Strength", "Test indipendenti", "Successi indipendenti", "Break indipendenti", "Reliability %"
     ])
     all_export = all_zones.copy()
@@ -875,7 +923,7 @@ if payload:
         a, b, c, d = st.columns(4)
         a.metric("Ultimo Close", f"{float(selected_row['Ultimo Close']):.4f}")
         b.metric("Balance", f"{float(selected_row['Balance']):.4f}")
-        c.metric("Tocchi ultime 3 chiuse", str(selected_row["Tocchi ultime 3 chiuse"]))
+        c.metric("Tocchi ultime 5 chiuse", str(selected_row["Tocchi ultime 5 chiuse"]))
         d.metric("Reliability", "n/d" if pd.isna(selected_row["Reliability %"]) else f"{float(selected_row['Reliability %']):.0f}%")
 
     with st.expander("Tutte le Balance calcolate"):
