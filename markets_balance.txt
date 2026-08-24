@@ -1,0 +1,13 @@
+# Formato: Etichetta;Ticker Yahoo Finance
+ES;ES=F
+NQ;NQ=F
+YM;YM=F
+RTY;RTY=F
+Gold;GC=F
+Silver;SI=F
+Copper;HG=F
+WTI;CL=F
+NatGas;NG=F
+EURUSD;EURUSD=X
+GBPUSD;GBPUSD=X
+USDJPY;JPY=X
