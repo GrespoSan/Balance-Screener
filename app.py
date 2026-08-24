@@ -20,7 +20,7 @@ import yfinance as yf
 # PAGE
 # =============================================================================
 st.set_page_config(page_title="G. Balance Stock screener", page_icon="🎯", layout="wide")
-st.title("🎯 G. Balance Stock screener")
+st.title("🎯 G. Balance Stock Screener")
 
 LOOKBACK = 500
 INTERACTION_WINDOW = 3
