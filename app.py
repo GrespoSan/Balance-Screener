@@ -434,7 +434,7 @@ def refresh_stale_daily_data(
 
 
 class _SimpleHTMLTableParser(HTMLParser):
-    """Parser minimale per la tabella HTML restituita dal sito Euronext."""
+    """Parser minimale per tabelle HTML pubbliche."""
     def __init__(self) -> None:
         super().__init__()
         self.rows: list[list[str]] = []
@@ -464,15 +464,16 @@ class _SimpleHTMLTableParser(HTMLParser):
             self._row = None
 
 
-def _http_text(url: str, *, data: bytes | None = None, timeout: int = 12) -> str:
+def _http_text(url: str, *, data: bytes | None = None, timeout: int = 12, accept: str = "text/html,*/*") -> str:
     req = Request(
         url,
         data=data,
         headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json, text/javascript, */*; q=0.01" if data is None else "*/*",
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept": accept,
+            "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
         },
         method="POST" if data is not None else "GET",
     )
@@ -480,77 +481,17 @@ def _http_text(url: str, *, data: bytes | None = None, timeout: int = 12) -> str
         return resp.read().decode("utf-8", errors="replace")
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def _euronext_adn_for_milan(ticker: str) -> str | None:
-    """Risoluzione ticker Yahoo .MI -> identificatore Euronext ISIN-MIC.
-    Usa l'endpoint pubblico di ricerca Euronext e preferisce il mercato cash MTAA.
-    """
-    root = ticker.upper().removesuffix(".MI")
-    url = f"https://live.euronext.com/en/instrumentSearch/searchJSON?q={quote(root)}"
-    try:
-        payload = json.loads(_http_text(url, timeout=10))
-    except Exception:
-        return None
-
-    candidates: list[dict[str, Any]] = []
-    if isinstance(payload, list):
-        candidates = [x for x in payload if isinstance(x, dict)]
-    elif isinstance(payload, dict):
-        # L'endpoint può essere restituito come lista di record oppure come colonne.
-        if isinstance(payload.get("value"), list):
-            n = len(payload.get("value", []))
-            keys = list(payload.keys())
-            for i in range(n):
-                rec: dict[str, Any] = {}
-                for key in keys:
-                    value = payload.get(key)
-                    if isinstance(value, list) and i < len(value):
-                        rec[key] = value[i]
-                candidates.append(rec)
-        else:
-            candidates = [payload]
-
-    if not candidates:
-        return None
-
-    def _val(rec: dict[str, Any], *keys: str) -> str:
-        for key in keys:
-            if key in rec and rec[key] is not None:
-                return str(rec[key]).strip()
-        return ""
-
-    ranked: list[tuple[int, str]] = []
-    for rec in candidates:
-        isin = _val(rec, "value", "isin", "ISIN").upper()
-        mic = _val(rec, "mic", "MIC").upper()
-        symbol = _val(rec, "symbol", "ticker", "mnemo", "code").upper()
-        label = _val(rec, "label", "name", "instrumentName").upper()
-        if not isin or not mic:
-            continue
-        score = 0
-        if symbol == root:
-            score += 100
-        if mic == "MTAA":
-            score += 80
-        elif mic in {"MTAH", "XMIL"}:
-            score += 40
-        if "MILAN" in label or "ITAL" in label:
-            score += 10
-        ranked.append((score, f"{isin}-{mic}"))
-    if not ranked:
-        return None
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return ranked[0][1]
-
-
-def _parse_euronext_number(value: Any) -> float:
+def _parse_public_number(value: Any) -> float:
     s = str(value).replace("\xa0", " ").strip()
-    if not s or s in {"-", "--", "N/A"}:
+    if not s or s in {"-", "--", "N/A", "n/a"}:
         return math.nan
     s = s.replace(" ", "")
-    # La pagina inglese usa normalmente il punto decimale e la virgola migliaia.
+    # Formato internazionale: 1,234.56. Formato europeo: 1.234,56.
     if "," in s and "." in s:
-        s = s.replace(",", "")
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
     elif "," in s:
         parts = s.split(",")
         if len(parts[-1]) <= 4:
@@ -564,27 +505,54 @@ def _parse_euronext_number(value: Any) -> float:
         return math.nan
 
 
-def _euronext_recent_daily(ticker: str, adjusted: bool, expected: pd.Timestamp) -> pd.DataFrame:
-    """Recupera le ultime sedute da Euronext e le normalizza in OHLC.
-    Viene usato SOLTANTO come fallback se Yahoo è arretrato per ticker .MI.
-    """
-    adn = _euronext_adn_for_milan(ticker)
-    if not adn:
-        return pd.DataFrame()
-    start = (expected - pd.Timedelta(days=18)).date().isoformat()
-    end = expected.date().isoformat()
-    form = urlencode({
-        "adjusted": "Y" if adjusted else "N",
-        "startdate": start,
-        "enddate": end,
-        "nbSession": "20",
-    }).encode("utf-8")
-    url = f"https://live.euronext.com/en/ajax/getHistoricalPricePopup/{quote(adn)}"
+def _yahoo_chart_recent_daily(ticker: str, adjusted: bool, expected: pd.Timestamp, market: str) -> pd.DataFrame:
+    """Fallback diretto all'endpoint Chart Yahoo, separato da yfinance."""
+    start = int((expected - pd.Timedelta(days=35)).tz_localize("UTC").timestamp())
+    end = int((expected + pd.Timedelta(days=3)).tz_localize("UTC").timestamp())
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(ticker)}"
+        f"?period1={start}&period2={end}&interval=1d&includePrePost=false"
+        f"&events=div%2Csplits&includeAdjustedClose=true"
+    )
     try:
-        html = _http_text(url, data=form, timeout=15)
+        payload = json.loads(_http_text(url, timeout=12, accept="application/json,*/*"))
+        result = ((payload.get("chart") or {}).get("result") or [None])[0]
+        if not result:
+            return pd.DataFrame()
+        ts = result.get("timestamp") or []
+        quote_block = (((result.get("indicators") or {}).get("quote") or [{}])[0])
+        adj_block = (((result.get("indicators") or {}).get("adjclose") or [{}])[0])
+        if not ts:
+            return pd.DataFrame()
+        tz_name, _ = _market_clock_for_ticker(ticker, market)
+        idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(ZoneInfo(tz_name)).tz_localize(None).normalize()
+        out = pd.DataFrame(index=idx)
+        for src, dst in (("open","open"),("high","high"),("low","low"),("close","close"),("volume","volume")):
+            vals = quote_block.get(src) or [math.nan] * len(idx)
+            out[dst] = pd.to_numeric(pd.Series(vals, index=idx), errors="coerce")
+        if adjusted:
+            adj_vals = adj_block.get("adjclose") or [math.nan] * len(idx)
+            adj = pd.to_numeric(pd.Series(adj_vals, index=idx), errors="coerce")
+            raw_close = out["close"].replace(0, np.nan)
+            factor = (adj / raw_close).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+            for c in ("open", "high", "low", "close"):
+                out[c] = out[c] * factor
+        out = out.dropna(subset=["open", "high", "low", "close"])
+        return out[~out.index.duplicated(keep="last")].sort_index()
     except Exception:
         return pd.DataFrame()
 
+
+def _stockanalysis_recent_daily(ticker: str, adjusted: bool, expected: pd.Timestamp) -> pd.DataFrame:
+    """Fallback HTML per titoli di Borsa Italiana. Usa solo le righe recenti mancanti."""
+    if not ticker.upper().endswith(".MI"):
+        return pd.DataFrame()
+    root = ticker.upper().removesuffix(".MI")
+    url = f"https://stockanalysis.com/quote/bit/{quote(root)}/history/"
+    try:
+        html = _http_text(url, timeout=12)
+    except Exception:
+        return pd.DataFrame()
     parser = _SimpleHTMLTableParser()
     try:
         parser.feed(html)
@@ -593,8 +561,7 @@ def _euronext_recent_daily(ticker: str, adjusted: bool, expected: pd.Timestamp) 
     rows = parser.rows
     if len(rows) < 2:
         return pd.DataFrame()
-
-    header_idx = next((i for i, row in enumerate(rows) if any(str(x).strip().lower() == "date" for x in row)), None)
+    header_idx = next((i for i, r in enumerate(rows) if r and str(r[0]).strip().lower() == "date" and any(str(x).strip().lower() == "open" for x in r)), None)
     if header_idx is None:
         return pd.DataFrame()
     header = [str(x).strip() for x in rows[header_idx]]
@@ -603,38 +570,80 @@ def _euronext_recent_daily(ticker: str, adjusted: bool, expected: pd.Timestamp) 
         return pd.DataFrame()
     frame = pd.DataFrame([r[:len(header)] for r in body], columns=header)
     cmap = {str(c).strip().lower(): c for c in frame.columns}
-
-    def _col(*names: str) -> str | None:
-        for name in names:
-            if name.lower() in cmap:
-                return cmap[name.lower()]
+    def col(*names: str) -> str | None:
+        for n in names:
+            if n.lower() in cmap:
+                return cmap[n.lower()]
         return None
-
-    c_date = _col("Date")
-    c_open = _col("Open")
-    c_high = _col("High")
-    c_low = _col("Low")
-    c_close = _col("Close", "Last")
-    c_vol = _col("Number of shares", "Volume")
+    c_date, c_open, c_high, c_low, c_close = col("Date"), col("Open"), col("High"), col("Low"), col("Close")
+    c_adj, c_vol = col("Adj. Close", "Adj Close"), col("Volume")
     if not all((c_date, c_open, c_high, c_low, c_close)):
         return pd.DataFrame()
-
-    idx = pd.to_datetime(frame[c_date], dayfirst=True, errors="coerce")
+    idx = pd.to_datetime(frame[c_date], errors="coerce")
     out = pd.DataFrame(index=idx)
-    out["open"] = frame[c_open].map(_parse_euronext_number).to_numpy()
-    out["high"] = frame[c_high].map(_parse_euronext_number).to_numpy()
-    out["low"] = frame[c_low].map(_parse_euronext_number).to_numpy()
-    out["close"] = frame[c_close].map(_parse_euronext_number).to_numpy()
-    out["volume"] = frame[c_vol].map(_parse_euronext_number).to_numpy() if c_vol else 0.0
+    out["open"] = frame[c_open].map(_parse_public_number).to_numpy()
+    out["high"] = frame[c_high].map(_parse_public_number).to_numpy()
+    out["low"] = frame[c_low].map(_parse_public_number).to_numpy()
+    out["close"] = frame[c_close].map(_parse_public_number).to_numpy()
+    out["volume"] = frame[c_vol].map(_parse_public_number).to_numpy() if c_vol else 0.0
+    if adjusted and c_adj:
+        adj = frame[c_adj].map(_parse_public_number).to_numpy()
+        raw = out["close"].to_numpy(dtype=float)
+        factor = np.where(np.isfinite(adj) & np.isfinite(raw) & (raw != 0), adj / raw, 1.0)
+        for c in ("open", "high", "low", "close"):
+            out[c] = out[c].to_numpy(dtype=float) * factor
     out = out[~out.index.isna()].dropna(subset=["open", "high", "low", "close"])
     if out.empty:
         return out
     out.index = pd.DatetimeIndex(out.index).tz_localize(None).normalize()
-    out = out[~out.index.duplicated(keep="last")].sort_index()
-    return out
+    return out[~out.index.duplicated(keep="last")].sort_index()
 
 
-def refresh_stale_italy_from_euronext(
+def _stooq_recent_daily(ticker: str, expected: pd.Timestamp) -> pd.DataFrame:
+    """Ultimo fallback CSV gratuito. Per Milano prova il simbolo root.it."""
+    if not ticker.upper().endswith(".MI"):
+        return pd.DataFrame()
+    symbol = ticker.upper().removesuffix(".MI").lower() + ".it"
+    d1 = (expected - pd.Timedelta(days=35)).strftime("%Y%m%d")
+    d2 = (expected + pd.Timedelta(days=1)).strftime("%Y%m%d")
+    url = f"https://stooq.com/q/d/l/?s={quote(symbol)}&d1={d1}&d2={d2}&i=d"
+    try:
+        csv_text = _http_text(url, timeout=12, accept="text/csv,text/plain,*/*")
+        if "Date,Open,High,Low,Close" not in csv_text:
+            return pd.DataFrame()
+        frame = pd.read_csv(io.StringIO(csv_text))
+    except Exception:
+        return pd.DataFrame()
+    if frame.empty or "Date" not in frame.columns:
+        return pd.DataFrame()
+    idx = pd.to_datetime(frame["Date"], errors="coerce")
+    out = pd.DataFrame(index=idx)
+    for src, dst in (("Open","open"),("High","high"),("Low","low"),("Close","close"),("Volume","volume")):
+        if src in frame.columns:
+            out[dst] = pd.to_numeric(frame[src], errors="coerce").to_numpy()
+        elif dst == "volume":
+            out[dst] = 0.0
+        else:
+            return pd.DataFrame()
+    out = out[~out.index.isna()].dropna(subset=["open", "high", "low", "close"])
+    if out.empty:
+        return out
+    out.index = pd.DatetimeIndex(out.index).tz_localize(None).normalize()
+    return out[~out.index.duplicated(keep="last")].sort_index()
+
+
+def _merge_recent_rows(old: pd.DataFrame, recent: pd.DataFrame) -> pd.DataFrame:
+    if recent.empty:
+        return old
+    if old.empty:
+        return recent.copy()
+    base = _normalize_ohlc(old)
+    base.index = pd.DatetimeIndex(base.index).tz_localize(None).normalize()
+    merged = pd.concat([base, recent], axis=0).sort_index()
+    return merged[~merged.index.duplicated(keep="last")]
+
+
+def refresh_stale_italy_from_public_fallbacks(
     data_map: dict[str, pd.DataFrame],
     tickers: list[str],
     adjusted: bool,
@@ -642,10 +651,7 @@ def refresh_stale_italy_from_euronext(
     notes: dict[str, str],
     progress: Any | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str], int, list[str]]:
-    """Secondo fallback di freschezza per Euronext Milan.
-    Se Yahoo/yfinance resta arretrato, integra le sedute mancanti dal sito Euronext.
-    Se anche Euronext non aggiorna la serie, il ticker viene segnalato come stale residuo.
-    """
+    """Integra solo Daily mancanti. Ordine: Yahoo Chart diretto -> StockAnalysis -> Stooq."""
     italy_tickers = [t for t in tickers if market == "Italia" or t.upper().endswith(".MI")]
     stale: list[str] = []
     for t in italy_tickers:
@@ -655,9 +661,7 @@ def refresh_stale_italy_from_euronext(
         closed, _ = only_closed_daily(raw, t, market)
         if closed.empty:
             continue
-        expected = _expected_last_closed_daily(t, market)
-        last = pd.Timestamp(closed.index[-1]).normalize()
-        if last < expected:
+        if pd.Timestamp(closed.index[-1]).normalize() < _expected_last_closed_daily(t, market):
             stale.append(t)
 
     refreshed = 0
@@ -666,36 +670,39 @@ def refresh_stale_italy_from_euronext(
         expected = _expected_last_closed_daily(t, market)
         if progress is not None:
             frac = 0.40 + 0.08 * (i / max(1, len(stale)))
-            progress.progress(min(frac, 0.48), text=f"Fallback Euronext {i}/{len(stale)} · {t}")
-        try:
-            eu = _euronext_recent_daily(t, adjusted, expected)
-            if eu.empty:
-                still_stale.append(t)
-                notes[t] = notes.get(t, "") + " | Euronext: nessun dato recente."
+            progress.progress(min(frac, 0.48), text=f"Fallback Daily {i}/{len(stale)} · {t}")
+        providers = (
+            ("Yahoo Chart", lambda: _yahoo_chart_recent_daily(t, adjusted, expected, market)),
+            ("StockAnalysis", lambda: _stockanalysis_recent_daily(t, adjusted, expected)),
+            ("Stooq", lambda: _stooq_recent_daily(t, expected)),
+        )
+        updated = False
+        provider_notes: list[str] = []
+        for provider_name, loader in providers:
+            try:
+                recent = loader()
+            except Exception as exc:
+                provider_notes.append(f"{provider_name}: {type(exc).__name__}")
                 continue
-            old = data_map.get(t, pd.DataFrame())
-            if old.empty:
-                merged = eu
-            else:
-                old = _normalize_ohlc(old)
-                old.index = pd.DatetimeIndex(old.index).tz_localize(None).normalize()
-                merged = pd.concat([old, eu], axis=0).sort_index()
-                merged = merged[~merged.index.duplicated(keep="last")]
+            if recent.empty:
+                provider_notes.append(f"{provider_name}: no data")
+                continue
+            merged = _merge_recent_rows(data_map.get(t, pd.DataFrame()), recent)
             closed, _ = only_closed_daily(merged, t, market)
             if closed.empty:
-                still_stale.append(t)
+                provider_notes.append(f"{provider_name}: no closed")
                 continue
             new_date = pd.Timestamp(closed.index[-1]).normalize()
             if new_date >= expected:
                 data_map[t] = merged
                 refreshed += 1
-                notes[t] = notes.get(t, "") + f" | Euronext OK: ultima Daily {new_date.date().isoformat()}."
-            else:
-                still_stale.append(t)
-                notes[t] = notes.get(t, "") + f" | Euronext ancora arretrato: {new_date.date().isoformat()}."
-        except Exception as exc:
+                notes[t] = notes.get(t, "") + f" | {provider_name} OK: ultima Daily {new_date.date().isoformat()}."
+                updated = True
+                break
+            provider_notes.append(f"{provider_name}: {new_date.date().isoformat()}")
+        if not updated:
             still_stale.append(t)
-            notes[t] = notes.get(t, "") + f" | Euronext fallito: {type(exc).__name__}: {exc}"
+            notes[t] = notes.get(t, "") + " | Fallback recenti: " + "; ".join(provider_notes)
 
     if progress is not None:
         progress.progress(0.48, text=f"Freschezza Italia completata · {refreshed} aggiornati · {len(still_stale)} ancora arretrati")
@@ -1269,7 +1276,7 @@ def scan_signature(
 # =============================================================================
 with st.sidebar:
     st.header("Impostazioni")
-    st.caption("Build V4.3")
+    st.caption("Build V4.4")
     market_choice = st.selectbox(
         "Mercato lista",
         ["Automatico", "Italia", "USA", "Misto / ticker Yahoo completi"],
@@ -1354,7 +1361,7 @@ if run:
 
     # Elimina subito il risultato precedente: durante una scansione USA non deve
     # restare visibile la vecchia tabella italiana.
-    st.session_state.pop("balance_stock_screener_v4_3", None)
+    st.session_state.pop("balance_stock_screener_v4_4", None)
 
     labels = {ticker: label for label, ticker in universe}
     tickers = [ticker for _, ticker in universe]
@@ -1363,7 +1370,7 @@ if run:
     data_map, notes, refreshed_stale = refresh_stale_daily_data(
         data_map, tickers, adjusted=adjusted, market=market, notes=notes, progress=progress
     )
-    data_map, notes, refreshed_euronext, still_stale = refresh_stale_italy_from_euronext(
+    data_map, notes, refreshed_fallback, still_stale = refresh_stale_italy_from_public_fallbacks(
         data_map, tickers, adjusted=adjusted, market=market, notes=notes, progress=progress
     )
     stale_set = set(still_stale)
@@ -1376,7 +1383,7 @@ if run:
     for i, ticker in enumerate(tickers, start=1):
         progress.progress(0.48 + 0.52 * ((i - 1) / len(tickers)), text=f"Balance {i}/{len(tickers)} · {ticker}")
         if ticker in stale_set:
-            errors.append({"Ticker": ticker, "Errore": "Daily arretrata: Yahoo ed Euronext non hanno fornito l'ultima seduta chiusa attesa."})
+            errors.append({"Ticker": ticker, "Errore": "Daily arretrata: Yahoo e i fallback pubblici non hanno fornito l'ultima seduta chiusa attesa."})
             continue
         data = data_map.get(ticker, pd.DataFrame())
         data, _open_bar_removed = only_closed_daily(data, ticker, market)
@@ -1397,7 +1404,7 @@ if run:
             errors.append({"Ticker": ticker, "Errore": f"{type(exc).__name__}: {exc}"})
 
     progress.progress(1.0, text="Completato")
-    st.session_state["balance_stock_screener_v4_3"] = {
+    st.session_state["balance_stock_screener_v4_4"] = {
         "signature": current_signature,
         "active_rows": active_rows,
         "all_rows": all_rows,
@@ -1410,11 +1417,11 @@ if run:
         "total_tickers": len(tickers),
         "downloaded_tickers": len(data_map),
         "refreshed_stale": int(refreshed_stale),
-        "refreshed_euronext": int(refreshed_euronext),
+        "refreshed_fallback": int(refreshed_fallback),
         "still_stale": list(still_stale),
     }
 
-payload = st.session_state.get("balance_stock_screener_v4_3")
+payload = st.session_state.get("balance_stock_screener_v4_4")
 if payload and payload.get("signature") == current_signature:
     active_rows = payload["active_rows"]
     all_rows = payload["all_rows"]
@@ -1442,12 +1449,12 @@ if payload and payload.get("signature") == current_signature:
     total_tickers = int(payload.get("total_tickers", len(details) + len(errors)))
     downloaded_tickers = int(payload.get("downloaded_tickers", len(details)))
     refreshed_stale = int(payload.get("refreshed_stale", 0))
-    refreshed_euronext = int(payload.get("refreshed_euronext", 0))
+    refreshed_fallback = int(payload.get("refreshed_fallback", 0))
     still_stale = list(payload.get("still_stale", []))
     if refreshed_stale > 0:
         st.caption(f"Freschezza dati: {refreshed_stale} ticker arretrati nel batch sono stati aggiornati con retry individuale Yahoo.")
-    if refreshed_euronext > 0:
-        st.caption(f"Freschezza Italia: {refreshed_euronext} ticker sono stati completati con Daily ufficiali Euronext.")
+    if refreshed_fallback > 0:
+        st.caption(f"Freschezza Italia: {refreshed_fallback} ticker sono stati completati con una sorgente Daily alternativa.")
     if still_stale:
         st.warning(f"Dati Daily ancora arretrati per {len(still_stale)} ticker: esclusi dallo screening per evitare segnali su dati vecchi.")
     if total_tickers >= 100 and downloaded_tickers < total_tickers * 0.80:
@@ -1498,7 +1505,7 @@ if payload and payload.get("signature") == current_signature:
     st.download_button(
         "⬇️ Esporta Excel",
         data=xlsx,
-        file_name="balance_stock_screener_v4_3.xlsx",
+        file_name="balance_stock_screener_v4_4.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 

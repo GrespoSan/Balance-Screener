@@ -1,9 +1,6 @@
-# G. Balance Stock Screener V4.3
+G. Balance Stock Screener V4.4
 
-Correzione esclusivamente sulla freschezza dati Daily italiani.
-
-- Yahoo/yfinance resta la sorgente principale.
-- Retry Yahoo individuale se la Daily è arretrata.
-- Per ticker .MI ancora arretrati: fallback pubblico Euronext sulle sole sedute recenti mancanti.
-- Se anche Euronext non aggiorna il dato, il ticker viene escluso dallo screening invece di usare una Daily vecchia.
-- Nessuna modifica a motore Balance, dominanza S/R, AREA ATTIVA, tocchi, Score o filtri.
+Modifica V4.4: gestione freschezza Daily Italia.
+La logica Balance, AREA ATTIVA, dominanza storica S/R, tocchi, Score e filtri non è stata modificata.
+Se Yahoo/yfinance è arretrato, il programma prova in sequenza Yahoo Chart diretto, StockAnalysis e Stooq e integra soltanto le Daily mancanti.
+I ticker che restano arretrati vengono esclusi per evitare segnali calcolati su dati vecchi.
