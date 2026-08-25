@@ -1,9 +1,9 @@
-# G. Balance Stock Screener V3.5
+G. Balance Stock Screener V3.8
 
-Unica modifica rispetto alla V3.4:
-
-- **Finestra candele (Daily chiuse)**: da 2 a 5, default 3;
-- **Tocchi minimi**: da 1 a 5, default 2;
-- default invariato: **2/3**.
-
-Nessun'altra modifica al motore Balance, AREA ATTIVA, ruolo Supporto/Resistenza, Score, ST/H/T/R, filtro visivo o gestione ticker.
+Correzione esclusivamente UI rispetto alla V3.7:
+- titolo esatto: 🎯 G. Balance Stock Screener
+- ordine sidebar:
+  1) Richiedi ultimo Close Daily dentro la Balance
+  2) Tocchi minimi (1-5, default 2)
+  3) Finestra candele (2-5, default 3)
+- nessun'altra modifica alla logica.
