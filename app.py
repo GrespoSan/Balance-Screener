@@ -26,10 +26,9 @@ LOOKBACK = 500
 DEFAULT_INTERACTION_WINDOW = 3
 DEFAULT_MIN_INTERACTION_BARS = 2
 
-# Classificazione operativa IDENTICA ai default di G. Balance Zones Pro v0.5.1.8.
-# Non modifica AREA ATTIVA V4.4. Il ruolo operativo viene calcolato con la stessa
-# f_role() del Balance Zones Pro e con il Close Daily chiuso precedente come
-# riferimento stabile, replicando il principio stableOnOpenBar del Pine.
+# Dominanza storica S/R ricavata ESCLUSIVAMENTE dalle statistiche già contenute
+# nella Balance. Non modifica AREA ATTIVA e non usa il prezzo corrente.
+# Usa le stesse soglie originali del motore per successi indipendenti e Hit compatibili.
 ROLE_SUPPORT = 1
 ROLE_RESISTANCE = -1
 ROLE_BALANCE = 0
@@ -38,7 +37,6 @@ OPERATIONAL_MIN_INDEPENDENT_TESTS = 2
 OPERATIONAL_MIN_RELIABILITY = 35.0
 OPERATIONAL_MIN_SUCCESSES = 2
 FALLBACK_MIN_COMPATIBLE_HITS = 2
-POSITIONAL_FALLBACK = True
 
 
 # =============================================================================
@@ -574,79 +572,56 @@ def analyze_balance_zones(
 
 
 # =============================================================================
-# RUOLO OPERATIVO — porting diretto di f_role() da G. Balance Zones Pro v0.5.1.8
+# DOMINANZA STORICA S/R — usa SOLO le statistiche già contenute nella Balance
 # =============================================================================
-def balance_zone_role_original(z: BalanceZone, ref_close: float) -> int:
-    """Replica f_role() del Pine originale sui default operativi.
+def balance_zone_historical_dominance(z: BalanceZone) -> int:
+    """Classifica la dominanza storica della Balance, senza usare il prezzo corrente.
 
-    Nota: se ref_close è dentro la fascia, il Pine restituisce ROLE_BALANCE.
+    Ordine identico alle evidenze del motore originale:
+    1) successi indipendenti Support/Resistance, con le soglie operative originali;
+    2) fallback sui Support/Resistance Hits compatibili, con la stessa dominanza 1.35;
+    3) se nessun lato domina chiaramente, ROLE_BALANCE = NEUTRA.
+
+    Non usa ref_close, posizione della zona rispetto al prezzo o positional fallback.
     """
-    inside = float(ref_close) >= z.center - z.half and float(ref_close) <= z.center + z.half
-    role = ROLE_BALANCE
-    if not inside:
-        enough_independent = (
-            z.independent_tests >= OPERATIONAL_MIN_INDEPENDENT_TESTS
-            and not pd.isna(z.reliability)
-            and float(z.reliability) >= OPERATIONAL_MIN_RELIABILITY
+    enough_independent = (
+        z.independent_tests >= OPERATIONAL_MIN_INDEPENDENT_TESTS
+        and not pd.isna(z.reliability)
+        and float(z.reliability) >= OPERATIONAL_MIN_RELIABILITY
+    )
+    if enough_independent:
+        support_dominant = (
+            z.independent_support_success >= OPERATIONAL_MIN_SUCCESSES
+            and z.independent_support_success >= max(1.0, z.independent_resistance_success * ROLE_DOMINANCE_RATIO)
         )
-        if enough_independent:
-            support_dominant = (
-                z.independent_support_success >= OPERATIONAL_MIN_SUCCESSES
-                and z.independent_support_success >= max(1.0, z.independent_resistance_success * ROLE_DOMINANCE_RATIO)
-            )
-            resistance_dominant = (
-                z.independent_resistance_success >= OPERATIONAL_MIN_SUCCESSES
-                and z.independent_resistance_success >= max(1.0, z.independent_support_success * ROLE_DOMINANCE_RATIO)
-            )
-            if z.center < float(ref_close) and support_dominant:
-                role = ROLE_SUPPORT
-            elif z.center > float(ref_close) and resistance_dominant:
-                role = ROLE_RESISTANCE
+        resistance_dominant = (
+            z.independent_resistance_success >= OPERATIONAL_MIN_SUCCESSES
+            and z.independent_resistance_success >= max(1.0, z.independent_support_success * ROLE_DOMINANCE_RATIO)
+        )
+        if support_dominant:
+            return ROLE_SUPPORT
+        if resistance_dominant:
+            return ROLE_RESISTANCE
 
-        if role == ROLE_BALANCE:
-            compatible_support_dominant = (
-                z.support_hits >= FALLBACK_MIN_COMPATIBLE_HITS
-                and z.support_hits >= max(1.0, z.resistance_hits * ROLE_DOMINANCE_RATIO)
-            )
-            compatible_resistance_dominant = (
-                z.resistance_hits >= FALLBACK_MIN_COMPATIBLE_HITS
-                and z.resistance_hits >= max(1.0, z.support_hits * ROLE_DOMINANCE_RATIO)
-            )
-            if z.center < float(ref_close) and compatible_support_dominant:
-                role = ROLE_SUPPORT
-            elif z.center > float(ref_close) and compatible_resistance_dominant:
-                role = ROLE_RESISTANCE
-            elif POSITIONAL_FALLBACK:
-                if z.center < float(ref_close) and z.hits >= FALLBACK_MIN_COMPATIBLE_HITS:
-                    role = ROLE_SUPPORT
-                elif z.center > float(ref_close) and z.hits >= FALLBACK_MIN_COMPATIBLE_HITS:
-                    role = ROLE_RESISTANCE
-    return int(role)
+    compatible_support_dominant = (
+        z.support_hits >= FALLBACK_MIN_COMPATIBLE_HITS
+        and z.support_hits >= max(1.0, z.resistance_hits * ROLE_DOMINANCE_RATIO)
+    )
+    compatible_resistance_dominant = (
+        z.resistance_hits >= FALLBACK_MIN_COMPATIBLE_HITS
+        and z.resistance_hits >= max(1.0, z.support_hits * ROLE_DOMINANCE_RATIO)
+    )
+    if compatible_support_dominant:
+        return ROLE_SUPPORT
+    if compatible_resistance_dominant:
+        return ROLE_RESISTANCE
+    return ROLE_BALANCE
 
 
-def role_on_stable_reference(data: pd.DataFrame, z: BalanceZone) -> dict[str, Any]:
-    """Classificazione operativa con la stessa f_role() del Balance Zones Pro.
-
-    Lo screener Python lavora solo su Daily chiuse. Per descrivere il ruolo della
-    Balance durante l'ultima Daily analizzata usa come riferimento stabile il Close
-    della Daily chiusa precedente (equivalente al close[1] usato dal Pine con
-    ``stableOnOpenBar`` mentre la barra corrente è aperta).
-
-    Non cerca un Close arbitrariamente lontano e non modifica AREA ATTIVA V4.4.
-    """
-    if data.empty or len(data) < 2:
-        return {"role": ROLE_BALANCE, "label": "BALANCE", "ref_close": math.nan, "ref_date": ""}
-
-    pos = len(data) - 2
-    ref_close = float(data.iloc[pos]["close"])
-    role = balance_zone_role_original(z, ref_close)
-    label = "SUPPORTO" if role == ROLE_SUPPORT else "RESISTENZA" if role == ROLE_RESISTANCE else "BALANCE"
-    return {
-        "role": role,
-        "label": label,
-        "ref_close": ref_close,
-        "ref_date": pd.Timestamp(data.index[pos]).strftime("%Y-%m-%d"),
-    }
+def historical_dominance_info(z: BalanceZone) -> dict[str, Any]:
+    role = balance_zone_historical_dominance(z)
+    label = "SUPPORTO" if role == ROLE_SUPPORT else "RESISTENZA" if role == ROLE_RESISTANCE else "NEUTRA"
+    return {"role": int(role), "label": label}
 
 
 # =============================================================================
@@ -734,12 +709,12 @@ def active_zone_row(
 
     flags = best_metrics["touch_flags"]
     z = best_zone
-    entry_role = role_on_stable_reference(data, z)
+    dominance = historical_dominance_info(z)
     return {
         "Strumento": label,
         "Ticker": ticker,
         "Area": "AREA ATTIVA",
-        "Ruolo": entry_role["label"],
+        "Dominanza S/R": dominance["label"],
         "Ultimo Close": last_close,
         "Balance": z.center,
         "Zona min": z.center - z.half,
@@ -759,9 +734,7 @@ def active_zone_row(
         "Dwell": z.dwell,
         "Last Hit Age": z.last_hit_age,
         "Data ultima Daily chiusa": last_date.strftime("%Y-%m-%d"),
-        "Data riferimento ruolo": entry_role["ref_date"],
-        "Close riferimento ruolo": entry_role["ref_close"],
-        "_role_code": entry_role["role"],
+        "_role_code": dominance["role"],
         "_zone_index": best_idx,
     }
 
@@ -782,13 +755,13 @@ def all_balance_rows(
     rows: list[dict[str, Any]] = []
     for idx, z in enumerate(balance.get("zones", []), start=1):
         m = _v44_active_metrics(data, z, require_last_close_inside, interaction_window, min_interaction_bars)
-        entry_role = role_on_stable_reference(data, z)
+        dominance = historical_dominance_info(z)
         rows.append({
             "Strumento": label,
             "Ticker": ticker,
             "Zona #": idx,
             "Area attiva": "SI" if m["active"] else "NO",
-            "Ruolo operativo": entry_role["label"],
+            "Dominanza S/R": dominance["label"],
             "Ultimo Close": last_close,
             "Balance": z.center,
             "Zona min": z.center - z.half,
@@ -814,8 +787,8 @@ def all_balance_rows(
 # =============================================================================
 # CHART / EXCEL
 # =============================================================================
-def plot_balance(data: pd.DataFrame, ticker: str, active_center: float, active_bottom: float, active_top: float, role_label: str) -> go.Figure:
-    """Grafico V4.4 + ruolo operativo calcolato con f_role originale."""
+def plot_balance(data: pd.DataFrame, ticker: str, active_center: float, active_bottom: float, active_top: float, dominance_label: str) -> go.Figure:
+    """Grafico AREA ATTIVA + dominanza storica S/R della Balance."""
     chart = data.tail(220)
     fig = go.Figure(data=[go.Candlestick(
         x=chart.index,
@@ -823,7 +796,7 @@ def plot_balance(data: pd.DataFrame, ticker: str, active_center: float, active_b
         name=ticker,
     )])
 
-    role = str(role_label).upper()
+    role = str(dominance_label).upper()
     if role == "SUPPORTO":
         line_color = "rgba(0, 150, 90, 1.0)"
         fill_color = "rgba(0, 150, 90, 0.20)"
@@ -913,7 +886,7 @@ def scan_signature(
 # =============================================================================
 with st.sidebar:
     st.header("Impostazioni")
-    st.caption("Build V3.7")
+    st.caption("Build V4.0")
     market_choice = st.selectbox(
         "Mercato lista",
         ["Automatico", "Italia", "USA", "Misto / ticker Yahoo completi"],
@@ -924,7 +897,7 @@ with st.sidebar:
         "Mostra aree",
         ["Supporto", "Resistenza", "Entrambe"],
         index=0,
-        help="Solo filtro visivo: non rilancia e non modifica lo screening. SUPPORTO/RESISTENZA sono calcolati con la f_role originale del Balance Zones Pro usando il Close Daily chiuso precedente come riferimento stabile.",
+        help="Solo filtro visivo: non rilancia e non modifica lo screening. SUPPORTO/RESISTENZA sono calcolati con la dominanza storica S/R già contenuta nelle statistiche della Balance. È solo un filtro visivo.",
     )
     adjusted = st.checkbox(
         "Prezzi Yahoo adjusted",
@@ -998,7 +971,7 @@ if run:
 
     # Elimina subito il risultato precedente: durante una scansione USA non deve
     # restare visibile la vecchia tabella italiana.
-    st.session_state.pop("balance_stock_screener_v3_4", None)
+    st.session_state.pop("balance_stock_screener_v4_0", None)
 
     labels = {ticker: label for label, ticker in universe}
     tickers = [ticker for _, ticker in universe]
@@ -1031,7 +1004,7 @@ if run:
             errors.append({"Ticker": ticker, "Errore": f"{type(exc).__name__}: {exc}"})
 
     progress.progress(1.0, text="Completato")
-    st.session_state["balance_stock_screener_v3_4"] = {
+    st.session_state["balance_stock_screener_v4_0"] = {
         "signature": current_signature,
         "active_rows": active_rows,
         "all_rows": all_rows,
@@ -1045,7 +1018,7 @@ if run:
         "downloaded_tickers": len(data_map),
     }
 
-payload = st.session_state.get("balance_stock_screener_v3_4")
+payload = st.session_state.get("balance_stock_screener_v4_0")
 if payload and payload.get("signature") == current_signature:
     active_rows = payload["active_rows"]
     all_rows = payload["all_rows"]
@@ -1058,12 +1031,12 @@ if payload and payload.get("signature") == current_signature:
     if active.empty:
         active_filtered = active.copy()
     elif role_filter == "Entrambe":
-        # SOLO FILTRO VISIVO: mostra supporti + resistenze già classificati.
-        # Le eventuali BALANCE non classificate restano fuori perché non sono né supporto né resistenza.
-        active_filtered = active[active["Ruolo"].astype(str).str.upper().isin(["SUPPORTO", "RESISTENZA"])].copy()
+        # SOLO FILTRO VISIVO: mostra supporti + resistenze già classificati per dominanza storica.
+        # Le eventuali zone NEUTRE restano fuori perché non hanno una dominanza storica S/R chiara.
+        active_filtered = active[active["Dominanza S/R"].astype(str).str.upper().isin(["SUPPORTO", "RESISTENZA"])].copy()
     else:
         wanted_role = "SUPPORTO" if role_filter == "Supporto" else "RESISTENZA"
-        active_filtered = active[active["Ruolo"].astype(str).str.upper() == wanted_role].copy()
+        active_filtered = active[active["Dominanza S/R"].astype(str).str.upper() == wanted_role].copy()
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Titoli con Balance calcolate", len(details))
@@ -1086,13 +1059,13 @@ if payload and payload.get("signature") == current_signature:
             st.info(f"Nessuna AREA ATTIVA: servono almeno {int(min_interaction_bars)} tocchi reali nelle ultime {int(interaction_window)} Daily chiuse.")
         active_view = active.copy()
     elif active_filtered.empty:
-        st.info(f"Nessuna AREA ATTIVA classificata come {role_filter.upper()} con il filtro visivo corrente.")
+        st.info(f"Nessuna AREA ATTIVA con dominanza storica {role_filter.upper()} con il filtro visivo corrente.")
         active_view = active_filtered.copy()
     else:
         active_filtered = active_filtered.sort_values(["Score", "ST", "Strumento"], ascending=[False, False, True]).reset_index(drop=True)
         active_view = active_filtered.copy()
         visible = [
-            "Strumento", "Ticker", "Area", "Ruolo", "Ultimo Close", "Balance", "Zona min", "Zona max",
+            "Strumento", "Ticker", "Area", "Dominanza S/R", "Ultimo Close", "Balance", "Zona min", "Zona max",
             "Tocchi", "Sequenza tocchi", "Score", "ST", "H", "T", "R %",
             "Data ultima Daily chiusa",
         ]
@@ -1112,7 +1085,7 @@ if payload and payload.get("signature") == current_signature:
         )
 
     active_export = active.drop(columns=["_zone_index", "_role_code", "_select"], errors="ignore") if not active.empty else pd.DataFrame(columns=[
-        "Strumento", "Ticker", "Area", "Ruolo", "Ultimo Close", "Balance", "Zona min", "Zona max",
+        "Strumento", "Ticker", "Area", "Dominanza S/R", "Ultimo Close", "Balance", "Zona min", "Zona max",
         "Tocchi", "Score", "ST", "H", "T", "R %"
     ])
     all_export = all_zones.copy()
@@ -1120,7 +1093,7 @@ if payload and payload.get("signature") == current_signature:
     st.download_button(
         "⬇️ Esporta Excel",
         data=xlsx,
-        file_name="balance_stock_active_v44_daily_closed.xlsx",
+        file_name="balance_stock_screener_v4_0.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -1138,12 +1111,12 @@ if payload and payload.get("signature") == current_signature:
                 float(selected_row["Balance"]),
                 float(selected_row["Zona min"]),
                 float(selected_row["Zona max"]),
-                str(selected_row["Ruolo"]),
+                str(selected_row["Dominanza S/R"]),
             ),
             use_container_width=True,
         )
         a, b, c, d, e = st.columns(5)
-        a.metric("Ruolo operativo", str(selected_row["Ruolo"]))
+        a.metric("Dominanza storica S/R", str(selected_row["Dominanza S/R"]))
         b.metric("Ultimo Close", f"{float(selected_row['Ultimo Close']):.4f}")
         c.metric("Balance", f"{float(selected_row['Balance']):.4f}")
         d.metric("Tocchi", str(selected_row["Tocchi"]))

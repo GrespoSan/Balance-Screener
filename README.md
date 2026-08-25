@@ -1,9 +1,11 @@
-G. Balance Stock Screener V3.8
+# G. Balance Stock Screener V4.0
 
-Correzione esclusivamente UI rispetto alla V3.7:
-- titolo esatto: 🎯 G. Balance Stock Screener
-- ordine sidebar:
-  1) Richiedi ultimo Close Daily dentro la Balance
-  2) Tocchi minimi (1-5, default 2)
-  3) Finestra candele (2-5, default 3)
-- nessun'altra modifica alla logica.
+Modifica principale rispetto alla V3.9:
+
+- Supporto / Resistenza è ora una **dominanza storica S/R** ricavata soltanto dalle statistiche già contenute nella Balance.
+- Prima usa i successi indipendenti Support/Resistance con le soglie originali.
+- Se non emerge una dominanza, usa Support H / Resistance H con la stessa dominanza originale.
+- Se nessun lato domina chiaramente, la zona è **NEUTRA**.
+- Il prezzo corrente, l'ultimo Close e il modo in cui il prezzo arriva oggi sulla zona NON determinano la dominanza S/R.
+- AREA ATTIVA, tocchi, finestra candele, Score e motore Balance restano invariati.
+- Il filtro Supporto / Resistenza / Entrambe è solo visivo.
