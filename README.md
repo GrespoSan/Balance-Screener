@@ -1,9 +1,9 @@
-# G. Balance Stock screener V2.8
+# G. Balance Stock Screener V3.5
 
-Modifiche rispetto alla V2.7:
-- filtro `Mostra aree` spostato subito sotto `Mercato lista`;
-- opzioni: `Supporto`, `Resistenza`, `Entrambi`;
-- default: `Supporto`;
-- aggiunta indicazione `Build V2.8` in sidebar per verificare immediatamente quale file sta eseguendo Streamlit.
+Unica modifica rispetto alla V3.4:
 
-Nessuna modifica al motore Balance, ai tocchi, al lookback o agli altri criteri dello screener.
+- **Finestra candele (Daily chiuse)**: da 2 a 5, default 3;
+- **Tocchi minimi**: da 1 a 5, default 2;
+- default invariato: **2/3**.
+
+Nessun'altra modifica al motore Balance, AREA ATTIVA, ruolo Supporto/Resistenza, Score, ST/H/T/R, filtro visivo o gestione ticker.
