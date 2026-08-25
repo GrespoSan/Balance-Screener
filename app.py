@@ -316,8 +316,107 @@ def load_universe_data(
             data_map[t] = df
             notes[t] = "Dati Daily acquisiti."
     if progress is not None:
-        progress.progress(0.35, text=f"Download completato · {len(data_map)}/{len(tickers)} ticker con dati")
+        progress.progress(0.30, text=f"Download completato · {len(data_map)}/{len(tickers)} ticker con dati")
     return data_map, notes
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def download_daily_individual(ticker: str, adjusted: bool) -> pd.DataFrame:
+    """Retry individuale: usato solo quando il batch risulta arretrato rispetto agli altri ticker dello stesso mercato."""
+    raw = yf.download(
+        tickers=ticker,
+        period="5y",
+        interval="1d",
+        auto_adjust=bool(adjusted),
+        actions=False,
+        group_by="ticker",
+        progress=False,
+        threads=False,
+        timeout=20,
+    )
+    return _extract_from_batch(raw, ticker, True)
+
+
+def _freshness_bucket(ticker: str, market: str) -> str:
+    """Separa Italia/USA per confrontare solo ticker con lo stesso calendario di mercato."""
+    t = ticker.upper()
+    if market == "Italia" or t.endswith(".MI"):
+        return "Italia"
+    if market == "USA":
+        return "USA"
+    return "Italia" if t.endswith(".MI") else "USA"
+
+
+def refresh_stale_daily_data(
+    data_map: dict[str, pd.DataFrame],
+    tickers: list[str],
+    adjusted: bool,
+    market: str,
+    notes: dict[str, str],
+    progress: Any | None = None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, str], int]:
+    """
+    Controllo freschezza senza modificare la logica Balance.
+    Per ogni mercato prende come riferimento la Daily chiusa più recente presente nel batch.
+    I soli ticker arretrati vengono riscaricati singolarmente e sostituiti se il retry è più fresco.
+    """
+    closed_preview: dict[str, pd.DataFrame] = {}
+    freshest: dict[str, pd.Timestamp] = {}
+
+    for t in tickers:
+        raw = data_map.get(t, pd.DataFrame())
+        if raw.empty:
+            continue
+        closed, _ = only_closed_daily(raw, t, market)
+        if closed.empty:
+            continue
+        closed_preview[t] = closed
+        d = pd.Timestamp(closed.index[-1]).normalize()
+        bucket = _freshness_bucket(t, market)
+        if bucket not in freshest or d > freshest[bucket]:
+            freshest[bucket] = d
+
+    stale: list[str] = []
+    for t, closed in closed_preview.items():
+        bucket = _freshness_bucket(t, market)
+        ref = freshest.get(bucket)
+        if ref is None:
+            continue
+        d = pd.Timestamp(closed.index[-1]).normalize()
+        if d < ref:
+            stale.append(t)
+
+    refreshed = 0
+    if progress is not None:
+        progress.progress(0.31, text=f"Controllo freschezza Daily · {len(stale)} ticker da verificare")
+
+    for i, t in enumerate(stale, start=1):
+        if progress is not None:
+            frac = 0.31 + 0.09 * (i / max(1, len(stale)))
+            progress.progress(min(frac, 0.40), text=f"Retry freschezza {i}/{len(stale)} · {t}")
+        try:
+            retry_raw = download_daily_individual(t, adjusted)
+            retry_closed, _ = only_closed_daily(retry_raw, t, market)
+            old_closed = closed_preview.get(t, pd.DataFrame())
+            if retry_closed.empty:
+                notes[t] = notes.get(t, "") + " | Retry freschezza senza dati."
+                continue
+            old_date = pd.Timestamp(old_closed.index[-1]).normalize() if not old_closed.empty else pd.Timestamp.min
+            new_date = pd.Timestamp(retry_closed.index[-1]).normalize()
+            if new_date > old_date:
+                data_map[t] = retry_raw
+                closed_preview[t] = retry_closed
+                refreshed += 1
+                notes[t] = f"Retry freschezza OK: ultima Daily {new_date.date().isoformat()}."
+            else:
+                notes[t] = notes.get(t, "") + f" | Retry freschezza: ultima Daily {new_date.date().isoformat()}."
+        except Exception as exc:
+            notes[t] = notes.get(t, "") + f" | Retry freschezza fallito: {type(exc).__name__}: {exc}"
+
+    if progress is not None:
+        progress.progress(0.40, text=f"Controllo freschezza completato · {refreshed} ticker aggiornati")
+    return data_map, notes, refreshed
+
 
 def _market_clock_for_ticker(ticker: str, market: str) -> tuple[str, time]:
     """Restituisce timezone e chiusura regolare per decidere se la Daily odierna è ancora aperta."""
@@ -886,7 +985,7 @@ def scan_signature(
 # =============================================================================
 with st.sidebar:
     st.header("Impostazioni")
-    st.caption("Build V4.0")
+    st.caption("Build V4.1")
     market_choice = st.selectbox(
         "Mercato lista",
         ["Automatico", "Italia", "USA", "Misto / ticker Yahoo completi"],
@@ -971,12 +1070,15 @@ if run:
 
     # Elimina subito il risultato precedente: durante una scansione USA non deve
     # restare visibile la vecchia tabella italiana.
-    st.session_state.pop("balance_stock_screener_v4_0", None)
+    st.session_state.pop("balance_stock_screener_v4_1", None)
 
     labels = {ticker: label for label, ticker in universe}
     tickers = [ticker for _, ticker in universe]
     progress = st.progress(0.0, text="Avvio scansione…")
     data_map, notes = load_universe_data(tickers, adjusted=adjusted, progress=progress)
+    data_map, notes, refreshed_stale = refresh_stale_daily_data(
+        data_map, tickers, adjusted=adjusted, market=market, notes=notes, progress=progress
+    )
 
     active_rows: list[dict[str, Any]] = []
     all_rows: list[dict[str, Any]] = []
@@ -984,7 +1086,7 @@ if run:
     errors: list[dict[str, str]] = []
 
     for i, ticker in enumerate(tickers, start=1):
-        progress.progress(0.35 + 0.65 * ((i - 1) / len(tickers)), text=f"Balance {i}/{len(tickers)} · {ticker}")
+        progress.progress(0.40 + 0.60 * ((i - 1) / len(tickers)), text=f"Balance {i}/{len(tickers)} · {ticker}")
         data = data_map.get(ticker, pd.DataFrame())
         data, _open_bar_removed = only_closed_daily(data, ticker, market)
         if data.empty or len(data) < 120:
@@ -1004,7 +1106,7 @@ if run:
             errors.append({"Ticker": ticker, "Errore": f"{type(exc).__name__}: {exc}"})
 
     progress.progress(1.0, text="Completato")
-    st.session_state["balance_stock_screener_v4_0"] = {
+    st.session_state["balance_stock_screener_v4_1"] = {
         "signature": current_signature,
         "active_rows": active_rows,
         "all_rows": all_rows,
@@ -1016,9 +1118,10 @@ if run:
         "require_last_close_inside": bool(require_last_close_inside),
         "total_tickers": len(tickers),
         "downloaded_tickers": len(data_map),
+        "refreshed_stale": int(refreshed_stale),
     }
 
-payload = st.session_state.get("balance_stock_screener_v4_0")
+payload = st.session_state.get("balance_stock_screener_v4_1")
 if payload and payload.get("signature") == current_signature:
     active_rows = payload["active_rows"]
     all_rows = payload["all_rows"]
@@ -1045,6 +1148,9 @@ if payload and payload.get("signature") == current_signature:
 
     total_tickers = int(payload.get("total_tickers", len(details) + len(errors)))
     downloaded_tickers = int(payload.get("downloaded_tickers", len(details)))
+    refreshed_stale = int(payload.get("refreshed_stale", 0))
+    if refreshed_stale > 0:
+        st.caption(f"Freschezza dati: {refreshed_stale} ticker arretrati nel batch sono stati aggiornati con retry individuale.")
     if total_tickers >= 100 and downloaded_tickers < total_tickers * 0.80:
         st.error(
             f"Scansione incompleta: Yahoo Finance ha restituito dati per {downloaded_tickers}/{total_tickers} ticker. "
@@ -1065,15 +1171,15 @@ if payload and payload.get("signature") == current_signature:
         active_filtered = active_filtered.sort_values(["Score", "ST", "Strumento"], ascending=[False, False, True]).reset_index(drop=True)
         active_view = active_filtered.copy()
         visible = [
-            "Strumento", "Ticker", "Area", "Dominanza S/R", "Ultimo Close", "Balance", "Zona min", "Zona max",
+            "Strumento", "Ticker", "Data ultima Daily chiusa", "Area", "Dominanza S/R", "Ultimo Close", "Balance", "Zona min", "Zona max",
             "Tocchi", "Sequenza tocchi", "Score", "ST", "H", "T", "R %",
-            "Data ultima Daily chiusa",
         ]
         st.dataframe(
             active_view[visible],
             hide_index=True,
             use_container_width=True,
             column_config={
+                "Data ultima Daily chiusa": st.column_config.TextColumn("Ultima Daily"),
                 "Ultimo Close": st.column_config.NumberColumn("Ultimo Close", format="%.4f"),
                 "Balance": st.column_config.NumberColumn("Balance", format="%.4f"),
                 "Zona min": st.column_config.NumberColumn("Zona min", format="%.4f"),
@@ -1093,7 +1199,7 @@ if payload and payload.get("signature") == current_signature:
     st.download_button(
         "⬇️ Esporta Excel",
         data=xlsx,
-        file_name="balance_stock_screener_v4_0.xlsx",
+        file_name="balance_stock_screener_v4_1.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -1115,12 +1221,13 @@ if payload and payload.get("signature") == current_signature:
             ),
             use_container_width=True,
         )
-        a, b, c, d, e = st.columns(5)
+        a, b, c, d, e, f = st.columns(6)
         a.metric("Dominanza storica S/R", str(selected_row["Dominanza S/R"]))
-        b.metric("Ultimo Close", f"{float(selected_row['Ultimo Close']):.4f}")
-        c.metric("Balance", f"{float(selected_row['Balance']):.4f}")
-        d.metric("Tocchi", str(selected_row["Tocchi"]))
-        e.metric("Score V4.4", f"{float(selected_row['Score']):.1f}")
+        b.metric("Ultima Daily", str(selected_row["Data ultima Daily chiusa"]))
+        c.metric("Ultimo Close", f"{float(selected_row['Ultimo Close']):.4f}")
+        d.metric("Balance", f"{float(selected_row['Balance']):.4f}")
+        e.metric("Tocchi", str(selected_row["Tocchi"]))
+        f.metric("Score V4.4", f"{float(selected_row['Score']):.1f}")
 
     with st.expander("Tutte le Balance calcolate · diagnostica"):
         if all_zones.empty:

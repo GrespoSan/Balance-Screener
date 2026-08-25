@@ -1,11 +1,12 @@
-# G. Balance Stock Screener V4.0
+# G. Balance Stock Screener V4.1
 
-Modifica principale rispetto alla V3.9:
+Modifica tecnica rispetto alla V4.0: controllo freschezza dei dati Daily Yahoo.
 
-- Supporto / Resistenza è ora una **dominanza storica S/R** ricavata soltanto dalle statistiche già contenute nella Balance.
-- Prima usa i successi indipendenti Support/Resistance con le soglie originali.
-- Se non emerge una dominanza, usa Support H / Resistance H con la stessa dominanza originale.
-- Se nessun lato domina chiaramente, la zona è **NEUTRA**.
-- Il prezzo corrente, l'ultimo Close e il modo in cui il prezzo arriva oggi sulla zona NON determinano la dominanza S/R.
-- AREA ATTIVA, tocchi, finestra candele, Score e motore Balance restano invariati.
-- Il filtro Supporto / Resistenza / Entrambe è solo visivo.
+- Il download principale resta batch.
+- Dopo il batch, ogni ticker viene confrontato con la Daily chiusa più recente disponibile nello stesso mercato.
+- Solo i ticker arretrati vengono riscaricati singolarmente.
+- Il dataset viene sostituito soltanto se il retry individuale contiene una Daily più recente.
+- La tabella mostra `Ultima Daily` vicino al ticker.
+- Nel grafico viene mostrata anche la data dell'ultima Daily utilizzata.
+
+Nessuna modifica a motore Balance, dominanza storica S/R, AREA ATTIVA, tocchi, Score o filtro visivo Supporto/Resistenza.
