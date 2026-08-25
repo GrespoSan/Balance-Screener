@@ -320,9 +320,8 @@ def load_universe_data(
     return data_map, notes
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def download_daily_individual(ticker: str, adjusted: bool) -> pd.DataFrame:
-    """Retry individuale: usato solo quando il batch risulta arretrato rispetto agli altri ticker dello stesso mercato."""
+    """Retry individuale non cached, usato quando la Daily è arretrata rispetto alla seduta attesa."""
     raw = yf.download(
         tickers=ticker,
         period="5y",
@@ -347,6 +346,25 @@ def _freshness_bucket(ticker: str, market: str) -> str:
     return "Italia" if t.endswith(".MI") else "USA"
 
 
+def _expected_last_closed_daily(ticker: str, market: str) -> pd.Timestamp:
+    """Ultima seduta che dovrebbe essere già chiusa, usando calendario lun-ven.
+    Le festività possono produrre un retry innocuo, ma non un falso dato più recente.
+    """
+    tz_name, regular_close = _market_clock_for_ticker(ticker, market)
+    now_local = pd.Timestamp.now(tz=ZoneInfo(tz_name))
+    d = now_local.date()
+    if now_local.time().replace(tzinfo=None) < regular_close:
+        d = d - pd.Timedelta(days=1)
+    else:
+        # Dopo la chiusura la Daily odierna può essere disponibile; se Yahoo non l'ha
+        # ancora pubblicata il retry non sostituisce comunque dati più vecchi con dati peggiori.
+        d = d
+    d = pd.Timestamp(d)
+    while d.weekday() >= 5:
+        d = d - pd.Timedelta(days=1)
+    return d.normalize()
+
+
 def refresh_stale_daily_data(
     data_map: dict[str, pd.DataFrame],
     tickers: list[str],
@@ -357,11 +375,10 @@ def refresh_stale_daily_data(
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str], int]:
     """
     Controllo freschezza senza modificare la logica Balance.
-    Per ogni mercato prende come riferimento la Daily chiusa più recente presente nel batch.
-    I soli ticker arretrati vengono riscaricati singolarmente e sostituiti se il retry è più fresco.
+    Ogni ticker viene confrontato con l'ultima seduta che dovrebbe essere già chiusa
+    per il suo mercato, così viene rilevato anche un intero batch Yahoo arretrato.
     """
     closed_preview: dict[str, pd.DataFrame] = {}
-    freshest: dict[str, pd.Timestamp] = {}
 
     for t in tickers:
         raw = data_map.get(t, pd.DataFrame())
@@ -371,19 +388,12 @@ def refresh_stale_daily_data(
         if closed.empty:
             continue
         closed_preview[t] = closed
-        d = pd.Timestamp(closed.index[-1]).normalize()
-        bucket = _freshness_bucket(t, market)
-        if bucket not in freshest or d > freshest[bucket]:
-            freshest[bucket] = d
 
     stale: list[str] = []
     for t, closed in closed_preview.items():
-        bucket = _freshness_bucket(t, market)
-        ref = freshest.get(bucket)
-        if ref is None:
-            continue
+        expected = _expected_last_closed_daily(t, market)
         d = pd.Timestamp(closed.index[-1]).normalize()
-        if d < ref:
+        if d < expected:
             stale.append(t)
 
     refreshed = 0
@@ -985,7 +995,7 @@ def scan_signature(
 # =============================================================================
 with st.sidebar:
     st.header("Impostazioni")
-    st.caption("Build V4.1")
+    st.caption("Build V4.2")
     market_choice = st.selectbox(
         "Mercato lista",
         ["Automatico", "Italia", "USA", "Misto / ticker Yahoo completi"],
