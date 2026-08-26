@@ -1,0 +1,1666 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+import io
+import math
+import re
+import hashlib
+import json
+from datetime import time
+from zoneinfo import ZoneInfo
+from html.parser import HTMLParser
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+
+
+# =============================================================================
+# PAGE
+# =============================================================================
+st.set_page_config(page_title="G. Balance Stock Screener", page_icon="🎯", layout="wide")
+st.title("🎯 G. Balance Stock Screener")
+
+LOOKBACK = 400
+DEFAULT_INTERACTION_WINDOW = 3
+DEFAULT_MIN_INTERACTION_BARS = 2
+
+# Dominanza storica S/R ricavata ESCLUSIVAMENTE dalle statistiche già contenute
+# nella Balance. Non modifica AREA ATTIVA e non usa il prezzo corrente.
+# Usa le stesse soglie originali del motore per successi indipendenti e Hit compatibili.
+ROLE_SUPPORT = 1
+ROLE_RESISTANCE = -1
+ROLE_BALANCE = 0
+ROLE_DOMINANCE_RATIO = 1.35
+OPERATIONAL_MIN_INDEPENDENT_TESTS = 2
+OPERATIONAL_MIN_RELIABILITY = 35.0
+OPERATIONAL_MIN_SUCCESSES = 2
+FALLBACK_MIN_COMPATIBLE_HITS = 2
+
+
+# =============================================================================
+# MODEL — stesso data model Balance usato nel motore COT Smart Money
+# =============================================================================
+@dataclass(frozen=True)
+class BalanceZone:
+    center: float
+    half: float
+    pct_range: float
+    strength: float
+    hits: int
+    support_hits: int
+    resistance_hits: int
+    dwell: int
+    last_hit_age: int
+    independent_tests: int
+    independent_successes: int
+    independent_support_success: int
+    independent_resistance_success: int
+    independent_breaks: int
+    reliability: float
+    engine: str = "A"
+
+
+# =============================================================================
+# TICKERS
+# =============================================================================
+def normalize_stock_ticker(ticker: str, market: str) -> str:
+    t = ticker.strip().upper()
+    if not t:
+        return t
+    if market == "Italia":
+        if "." not in t and "=" not in t and ":" not in t:
+            t = f"{t}.MI"
+    elif market == "USA":
+        if re.fullmatch(r"[A-Z0-9]+\.[A-Z]", t):
+            t = t.replace(".", "-")
+    return t
+
+
+def infer_market_from_text(text: str, source_name: str = "") -> str:
+    """Riconosce Italia/USA dai file ticker senza modificare la logica Balance."""
+    name = (source_name or "").upper()
+    if any(tag in name for tag in ("AZIONI_ITA", "ITALIA", "ITALY")):
+        return "Italia"
+    if any(tag in name for tag in ("STOCK USA", "AZIONI_USA", "_USA", " US ")):
+        return "USA"
+
+    raw_tokens = []
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+        if ";" in line or "\t" in line:
+            parts = [p.strip() for p in re.split(r"[;\t]", line) if p.strip()]
+            if parts:
+                raw_tokens.append(parts[-1].upper())
+        else:
+            raw_tokens.extend(t.strip().upper() for t in line.split(",") if t.strip())
+
+    if not raw_tokens:
+        return "USA"
+    mi_count = sum(t.endswith(".MI") or t.startswith("MIL:") for t in raw_tokens)
+    explicit_other_suffix = sum(bool(re.search(r"\.[A-Z]{1,4}$", t)) and not t.endswith(".MI") for t in raw_tokens)
+    if mi_count >= max(1, len(raw_tokens) // 2):
+        return "Italia"
+    if mi_count and explicit_other_suffix:
+        return "Misto / ticker Yahoo completi"
+    return "USA"
+
+
+def parse_tickers(text: str, market: str) -> list[tuple[str, str]]:
+    """
+    Formati accettati:
+    - lista separata da virgole, anche su una sola riga: ENI.MI, UCG.MI, ISP.MI
+    - un ticker per riga
+    - Nome;Ticker (oppure Nome<TAB>Ticker)
+
+    La virgola viene sempre interpretata come separatore di una LISTA di ticker,
+    non come coppia Nome,Ticker. Questo mantiene compatibilita con i file usati
+    dagli altri screener Python dell'utente.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    ignored_headers = {"TICKER", "TICKERS", "SYMBOL", "SYMBOLS", "SIMBOLO", "SIMBOLI"}
+
+    def add_item(label: str, raw_ticker: str) -> None:
+        raw_ticker = raw_ticker.strip().strip('"').strip("'")
+        label_clean = label.strip().strip('"').strip("'")
+        if not raw_ticker or raw_ticker.upper() in ignored_headers:
+            return
+        ticker = normalize_stock_ticker(raw_ticker, market)
+        if ticker and ticker not in seen:
+            out.append((label_clean or raw_ticker, ticker))
+            seen.add(ticker)
+
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+
+        # Formato descrittivo: Nome;Ticker oppure Nome<TAB>Ticker.
+        # Il punto e virgola NON viene usato per dividere una lista di ticker.
+        if ";" in line or "\t" in line:
+            parts = [p.strip() for p in re.split(r"[;\t]", line) if p.strip()]
+            if len(parts) >= 2:
+                add_item(parts[0], parts[-1])
+            elif parts:
+                add_item(parts[0], parts[0])
+            continue
+
+        # Formato lista degli screener esistenti: ticker separati da virgole.
+        if "," in line:
+            for token in line.split(","):
+                token = token.strip()
+                if token:
+                    add_item(token, token)
+            continue
+
+        # Un ticker per riga.
+        add_item(line, line)
+
+    return out
+
+
+def italy_example() -> str:
+    return """# Ticker Yahoo Italia\n1HOOD.MI
+1RHM.MI
+1TSLA.MI
+A2A.MI
+ACE.MI
+AMP.MI
+ARIS.MI
+AVIO.MI
+AZM.MI
+BAMI.MI
+BC.MI
+BDB.MI
+BMED.MI
+BMPS.MI
+BPE.MI
+BRE.MI
+BST.MI
+BZU.MI
+CE.MI
+CEM.MI
+CIRC.MI
+CPR.MI
+DBA.MI
+DIA.MI
+DIB.MI
+ELE.MI
+ELN.MI
+ENEL.MI
+ENI.MI
+ERG.MI
+FBK.MI
+FCT.MI
+G.MI
+GEO.MI
+HER.MI
+IF.MI
+IG.MI
+IGV.MI
+INRG.MI
+INW.MI
+IP.MI
+ISP.MI
+ITW.MI
+IVG.MI
+LDO.MI
+MB.MI
+MFEB.MI
+MONC.MI
+NEXI.MI
+PIRC.MI
+PRY.MI
+PST.MI
+PWS.MI
+RACE.MI
+RDUE.MI
+REC.MI
+REY.MI
+SES.MI
+SFER.MI
+SFL.MI
+SGF.MI
+SL.MI
+SPM.MI
+SRG.MI
+STLAM.MI
+STMMI.MI
+TEN.MI
+TES.MI
+TGYM.MI
+TIT.MI
+TPRO.MI
+TRN.MI
+UCG.MI
+UNI.MI
+WBD.MI
+"""
+
+def usa_example() -> str:
+    return """# Nome;Ticker
+Apple;AAPL
+Microsoft;MSFT
+Nvidia;NVDA
+Amazon;AMZN
+Alphabet;GOOGL
+Meta;META
+Tesla;TSLA
+Broadcom;AVGO
+Berkshire Hathaway;BRK-B
+JPMorgan;JPM
+Visa;V
+Mastercard;MA
+Eli Lilly;LLY
+UnitedHealth;UNH
+Exxon Mobil;XOM
+Costco;COST
+Walmart;WMT
+Netflix;NFLX
+AMD;AMD
+Salesforce;CRM
+"""
+
+
+# =============================================================================
+# DATA
+# =============================================================================
+def _normalize_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    x = df.copy()
+    x.columns = [str(c).lower().replace(" ", "_") for c in x.columns]
+    required = ["open", "high", "low", "close"]
+    if any(c not in x.columns for c in required):
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    if "volume" not in x.columns:
+        x["volume"] = np.nan
+    x = x[["open", "high", "low", "close", "volume"]].copy()
+    for c in x.columns:
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+    x = x.dropna(subset=required)
+    x = x[~x.index.duplicated(keep="last")].sort_index()
+    return x
+
+
+def _extract_from_batch(raw: pd.DataFrame, ticker: str, single: bool) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    if single and not isinstance(raw.columns, pd.MultiIndex):
+        return _normalize_ohlc(raw)
+    if isinstance(raw.columns, pd.MultiIndex):
+        lvl0 = set(map(str, raw.columns.get_level_values(0)))
+        lvl1 = set(map(str, raw.columns.get_level_values(1)))
+        try:
+            if ticker in lvl0:
+                return _normalize_ohlc(raw[ticker])
+            if ticker in lvl1:
+                return _normalize_ohlc(raw.xs(ticker, axis=1, level=1))
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def download_daily_chunk(tickers: tuple[str, ...], adjusted: bool) -> dict[str, pd.DataFrame]:
+    if not tickers:
+        return {}
+    raw = yf.download(
+        tickers=list(tickers),
+        period="5y",
+        interval="1d",
+        auto_adjust=bool(adjusted),
+        actions=False,
+        group_by="ticker",
+        progress=False,
+        threads=8,
+        timeout=15,
+    )
+    single = len(tickers) == 1
+    return {t: _extract_from_batch(raw, t, single) for t in tickers}
+
+
+def load_universe_data(
+    tickers: list[str], adjusted: bool, progress: Any | None = None
+) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    data_map: dict[str, pd.DataFrame] = {}
+    notes: dict[str, str] = {}
+    # Blocchi più ampi: meno overhead Streamlit/yfinance. yfinance limita comunque
+    # il parallelismo interno tramite threads.
+    chunk_size = 80
+    total_chunks = max(1, math.ceil(len(tickers) / chunk_size))
+    for chunk_no, start in enumerate(range(0, len(tickers), chunk_size), start=1):
+        chunk = tuple(tickers[start:start + chunk_size])
+        if progress is not None:
+            frac = 0.05 + 0.30 * ((chunk_no - 1) / total_chunks)
+            progress.progress(min(frac, 0.34), text=f"Download Yahoo {chunk_no}/{total_chunks} · {len(chunk)} ticker")
+        try:
+            result = download_daily_chunk(chunk, adjusted)
+        except Exception as exc:
+            for t in chunk:
+                notes[t] = f"Download batch: {type(exc).__name__}: {exc}"
+            continue
+        for t in chunk:
+            df = result.get(t, pd.DataFrame())
+            if df.empty:
+                notes[t] = "Nessun dato Yahoo Finance."
+                continue
+            data_map[t] = df
+            notes[t] = "Dati Daily acquisiti."
+    if progress is not None:
+        progress.progress(0.30, text=f"Download completato · {len(data_map)}/{len(tickers)} ticker con dati")
+    return data_map, notes
+
+
+def download_daily_individual(ticker: str, adjusted: bool) -> pd.DataFrame:
+    """Retry individuale non cached, usato quando la Daily è arretrata rispetto alla seduta attesa."""
+    raw = yf.download(
+        tickers=ticker,
+        period="5y",
+        interval="1d",
+        auto_adjust=bool(adjusted),
+        actions=False,
+        group_by="ticker",
+        progress=False,
+        threads=False,
+        timeout=20,
+    )
+    return _extract_from_batch(raw, ticker, True)
+
+
+def _freshness_bucket(ticker: str, market: str) -> str:
+    """Separa Italia/USA per confrontare solo ticker con lo stesso calendario di mercato."""
+    t = ticker.upper()
+    if market == "Italia" or t.endswith(".MI"):
+        return "Italia"
+    if market == "USA":
+        return "USA"
+    return "Italia" if t.endswith(".MI") else "USA"
+
+
+def _expected_last_closed_daily(ticker: str, market: str) -> pd.Timestamp:
+    """Ultima seduta che dovrebbe essere già chiusa, usando calendario lun-ven.
+    Le festività possono produrre un retry innocuo, ma non un falso dato più recente.
+    """
+    tz_name, regular_close = _market_clock_for_ticker(ticker, market)
+    now_local = pd.Timestamp.now(tz=ZoneInfo(tz_name))
+    d = now_local.date()
+    if now_local.time().replace(tzinfo=None) < regular_close:
+        d = d - pd.Timedelta(days=1)
+    else:
+        # Dopo la chiusura la Daily odierna può essere disponibile; se Yahoo non l'ha
+        # ancora pubblicata il retry non sostituisce comunque dati più vecchi con dati peggiori.
+        d = d
+    d = pd.Timestamp(d)
+    while d.weekday() >= 5:
+        d = d - pd.Timedelta(days=1)
+    return d.normalize()
+
+
+def refresh_stale_daily_data(
+    data_map: dict[str, pd.DataFrame],
+    tickers: list[str],
+    adjusted: bool,
+    market: str,
+    notes: dict[str, str],
+    progress: Any | None = None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, str], int]:
+    """
+    Controllo freschezza senza modificare la logica Balance.
+    Ogni ticker viene confrontato con l'ultima seduta che dovrebbe essere già chiusa
+    per il suo mercato, così viene rilevato anche un intero batch Yahoo arretrato.
+    """
+    closed_preview: dict[str, pd.DataFrame] = {}
+
+    for t in tickers:
+        raw = data_map.get(t, pd.DataFrame())
+        if raw.empty:
+            continue
+        closed, _ = only_closed_daily(raw, t, market)
+        if closed.empty:
+            continue
+        closed_preview[t] = closed
+
+    stale: list[str] = []
+    for t, closed in closed_preview.items():
+        expected = _expected_last_closed_daily(t, market)
+        d = pd.Timestamp(closed.index[-1]).normalize()
+        if d < expected:
+            stale.append(t)
+
+    refreshed = 0
+    if progress is not None:
+        progress.progress(0.31, text=f"Controllo freschezza Daily · {len(stale)} ticker da verificare")
+
+    for i, t in enumerate(stale, start=1):
+        if progress is not None:
+            frac = 0.31 + 0.09 * (i / max(1, len(stale)))
+            progress.progress(min(frac, 0.40), text=f"Retry freschezza {i}/{len(stale)} · {t}")
+        try:
+            retry_raw = download_daily_individual(t, adjusted)
+            retry_closed, _ = only_closed_daily(retry_raw, t, market)
+            old_closed = closed_preview.get(t, pd.DataFrame())
+            if retry_closed.empty:
+                notes[t] = notes.get(t, "") + " | Retry freschezza senza dati."
+                continue
+            old_date = pd.Timestamp(old_closed.index[-1]).normalize() if not old_closed.empty else pd.Timestamp.min
+            new_date = pd.Timestamp(retry_closed.index[-1]).normalize()
+            if new_date > old_date:
+                data_map[t] = retry_raw
+                closed_preview[t] = retry_closed
+                refreshed += 1
+                notes[t] = f"Retry freschezza OK: ultima Daily {new_date.date().isoformat()}."
+            else:
+                notes[t] = notes.get(t, "") + f" | Retry freschezza: ultima Daily {new_date.date().isoformat()}."
+        except Exception as exc:
+            notes[t] = notes.get(t, "") + f" | Retry freschezza fallito: {type(exc).__name__}: {exc}"
+
+    if progress is not None:
+        progress.progress(0.40, text=f"Controllo freschezza completato · {refreshed} ticker aggiornati")
+    return data_map, notes, refreshed
+
+
+
+class _SimpleHTMLTableParser(HTMLParser):
+    """Parser minimale per tabelle HTML pubbliche."""
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag == "tr":
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = []
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in ("td", "th") and self._row is not None and self._cell is not None:
+            value = " ".join("".join(self._cell).replace("\xa0", " ").split())
+            self._row.append(value)
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if self._row:
+                self.rows.append(self._row)
+            self._row = None
+
+
+def _http_text(url: str, *, data: bytes | None = None, timeout: int = 12, accept: str = "text/html,*/*") -> str:
+    req = Request(
+        url,
+        data=data,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept": accept,
+            "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        method="POST" if data is not None else "GET",
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _parse_public_number(value: Any) -> float:
+    s = str(value).replace("\xa0", " ").strip()
+    if not s or s in {"-", "--", "N/A", "n/a"}:
+        return math.nan
+    s = s.replace(" ", "")
+    # Formato internazionale: 1,234.56. Formato europeo: 1.234,56.
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        parts = s.split(",")
+        if len(parts[-1]) <= 4:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    s = re.sub(r"[^0-9eE+\-.]", "", s)
+    try:
+        return float(s)
+    except Exception:
+        return math.nan
+
+
+def _yahoo_chart_recent_daily(ticker: str, adjusted: bool, expected: pd.Timestamp, market: str) -> pd.DataFrame:
+    """Fallback diretto all'endpoint Chart Yahoo, separato da yfinance."""
+    start = int((expected - pd.Timedelta(days=35)).tz_localize("UTC").timestamp())
+    end = int((expected + pd.Timedelta(days=3)).tz_localize("UTC").timestamp())
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(ticker)}"
+        f"?period1={start}&period2={end}&interval=1d&includePrePost=false"
+        f"&events=div%2Csplits&includeAdjustedClose=true"
+    )
+    try:
+        payload = json.loads(_http_text(url, timeout=12, accept="application/json,*/*"))
+        result = ((payload.get("chart") or {}).get("result") or [None])[0]
+        if not result:
+            return pd.DataFrame()
+        ts = result.get("timestamp") or []
+        quote_block = (((result.get("indicators") or {}).get("quote") or [{}])[0])
+        adj_block = (((result.get("indicators") or {}).get("adjclose") or [{}])[0])
+        if not ts:
+            return pd.DataFrame()
+        tz_name, _ = _market_clock_for_ticker(ticker, market)
+        idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(ZoneInfo(tz_name)).tz_localize(None).normalize()
+        out = pd.DataFrame(index=idx)
+        for src, dst in (("open","open"),("high","high"),("low","low"),("close","close"),("volume","volume")):
+            vals = quote_block.get(src) or [math.nan] * len(idx)
+            out[dst] = pd.to_numeric(pd.Series(vals, index=idx), errors="coerce")
+        if adjusted:
+            adj_vals = adj_block.get("adjclose") or [math.nan] * len(idx)
+            adj = pd.to_numeric(pd.Series(adj_vals, index=idx), errors="coerce")
+            raw_close = out["close"].replace(0, np.nan)
+            factor = (adj / raw_close).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+            for c in ("open", "high", "low", "close"):
+                out[c] = out[c] * factor
+        out = out.dropna(subset=["open", "high", "low", "close"])
+        return out[~out.index.duplicated(keep="last")].sort_index()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _stockanalysis_recent_daily(ticker: str, adjusted: bool, expected: pd.Timestamp) -> pd.DataFrame:
+    """Fallback HTML per titoli di Borsa Italiana. Usa solo le righe recenti mancanti."""
+    if not ticker.upper().endswith(".MI"):
+        return pd.DataFrame()
+    root = ticker.upper().removesuffix(".MI")
+    url = f"https://stockanalysis.com/quote/bit/{quote(root)}/history/"
+    try:
+        html = _http_text(url, timeout=12)
+    except Exception:
+        return pd.DataFrame()
+    parser = _SimpleHTMLTableParser()
+    try:
+        parser.feed(html)
+    except Exception:
+        return pd.DataFrame()
+    rows = parser.rows
+    if len(rows) < 2:
+        return pd.DataFrame()
+    header_idx = next((i for i, r in enumerate(rows) if r and str(r[0]).strip().lower() == "date" and any(str(x).strip().lower() == "open" for x in r)), None)
+    if header_idx is None:
+        return pd.DataFrame()
+    header = [str(x).strip() for x in rows[header_idx]]
+    body = [r for r in rows[header_idx + 1:] if len(r) >= len(header)]
+    if not body:
+        return pd.DataFrame()
+    frame = pd.DataFrame([r[:len(header)] for r in body], columns=header)
+    cmap = {str(c).strip().lower(): c for c in frame.columns}
+    def col(*names: str) -> str | None:
+        for n in names:
+            if n.lower() in cmap:
+                return cmap[n.lower()]
+        return None
+    c_date, c_open, c_high, c_low, c_close = col("Date"), col("Open"), col("High"), col("Low"), col("Close")
+    c_adj, c_vol = col("Adj. Close", "Adj Close"), col("Volume")
+    if not all((c_date, c_open, c_high, c_low, c_close)):
+        return pd.DataFrame()
+    idx = pd.to_datetime(frame[c_date], errors="coerce")
+    out = pd.DataFrame(index=idx)
+    out["open"] = frame[c_open].map(_parse_public_number).to_numpy()
+    out["high"] = frame[c_high].map(_parse_public_number).to_numpy()
+    out["low"] = frame[c_low].map(_parse_public_number).to_numpy()
+    out["close"] = frame[c_close].map(_parse_public_number).to_numpy()
+    out["volume"] = frame[c_vol].map(_parse_public_number).to_numpy() if c_vol else 0.0
+    if adjusted and c_adj:
+        adj = frame[c_adj].map(_parse_public_number).to_numpy()
+        raw = out["close"].to_numpy(dtype=float)
+        factor = np.where(np.isfinite(adj) & np.isfinite(raw) & (raw != 0), adj / raw, 1.0)
+        for c in ("open", "high", "low", "close"):
+            out[c] = out[c].to_numpy(dtype=float) * factor
+    out = out[~out.index.isna()].dropna(subset=["open", "high", "low", "close"])
+    if out.empty:
+        return out
+    out.index = pd.DatetimeIndex(out.index).tz_localize(None).normalize()
+    return out[~out.index.duplicated(keep="last")].sort_index()
+
+
+def _stooq_recent_daily(ticker: str, expected: pd.Timestamp) -> pd.DataFrame:
+    """Ultimo fallback CSV gratuito. Per Milano prova il simbolo root.it."""
+    if not ticker.upper().endswith(".MI"):
+        return pd.DataFrame()
+    symbol = ticker.upper().removesuffix(".MI").lower() + ".it"
+    d1 = (expected - pd.Timedelta(days=35)).strftime("%Y%m%d")
+    d2 = (expected + pd.Timedelta(days=1)).strftime("%Y%m%d")
+    url = f"https://stooq.com/q/d/l/?s={quote(symbol)}&d1={d1}&d2={d2}&i=d"
+    try:
+        csv_text = _http_text(url, timeout=12, accept="text/csv,text/plain,*/*")
+        if "Date,Open,High,Low,Close" not in csv_text:
+            return pd.DataFrame()
+        frame = pd.read_csv(io.StringIO(csv_text))
+    except Exception:
+        return pd.DataFrame()
+    if frame.empty or "Date" not in frame.columns:
+        return pd.DataFrame()
+    idx = pd.to_datetime(frame["Date"], errors="coerce")
+    out = pd.DataFrame(index=idx)
+    for src, dst in (("Open","open"),("High","high"),("Low","low"),("Close","close"),("Volume","volume")):
+        if src in frame.columns:
+            out[dst] = pd.to_numeric(frame[src], errors="coerce").to_numpy()
+        elif dst == "volume":
+            out[dst] = 0.0
+        else:
+            return pd.DataFrame()
+    out = out[~out.index.isna()].dropna(subset=["open", "high", "low", "close"])
+    if out.empty:
+        return out
+    out.index = pd.DatetimeIndex(out.index).tz_localize(None).normalize()
+    return out[~out.index.duplicated(keep="last")].sort_index()
+
+
+def _merge_recent_rows(old: pd.DataFrame, recent: pd.DataFrame) -> pd.DataFrame:
+    if recent.empty:
+        return old
+    if old.empty:
+        return recent.copy()
+    base = _normalize_ohlc(old)
+    base.index = pd.DatetimeIndex(base.index).tz_localize(None).normalize()
+    merged = pd.concat([base, recent], axis=0).sort_index()
+    return merged[~merged.index.duplicated(keep="last")]
+
+
+def refresh_stale_italy_from_public_fallbacks(
+    data_map: dict[str, pd.DataFrame],
+    tickers: list[str],
+    adjusted: bool,
+    market: str,
+    notes: dict[str, str],
+    progress: Any | None = None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, str], int, list[str]]:
+    """Integra solo Daily mancanti. Ordine: Yahoo Chart diretto -> StockAnalysis -> Stooq."""
+    italy_tickers = [t for t in tickers if market == "Italia" or t.upper().endswith(".MI")]
+    stale: list[str] = []
+    for t in italy_tickers:
+        raw = data_map.get(t, pd.DataFrame())
+        if raw.empty:
+            continue
+        closed, _ = only_closed_daily(raw, t, market)
+        if closed.empty:
+            continue
+        if pd.Timestamp(closed.index[-1]).normalize() < _expected_last_closed_daily(t, market):
+            stale.append(t)
+
+    refreshed = 0
+    still_stale: list[str] = []
+    for i, t in enumerate(stale, start=1):
+        expected = _expected_last_closed_daily(t, market)
+        if progress is not None:
+            frac = 0.40 + 0.08 * (i / max(1, len(stale)))
+            progress.progress(min(frac, 0.48), text=f"Fallback Daily {i}/{len(stale)} · {t}")
+        providers = (
+            ("Yahoo Chart", lambda: _yahoo_chart_recent_daily(t, adjusted, expected, market)),
+            ("StockAnalysis", lambda: _stockanalysis_recent_daily(t, adjusted, expected)),
+            ("Stooq", lambda: _stooq_recent_daily(t, expected)),
+        )
+        updated = False
+        provider_notes: list[str] = []
+        for provider_name, loader in providers:
+            try:
+                recent = loader()
+            except Exception as exc:
+                provider_notes.append(f"{provider_name}: {type(exc).__name__}")
+                continue
+            if recent.empty:
+                provider_notes.append(f"{provider_name}: no data")
+                continue
+            merged = _merge_recent_rows(data_map.get(t, pd.DataFrame()), recent)
+            closed, _ = only_closed_daily(merged, t, market)
+            if closed.empty:
+                provider_notes.append(f"{provider_name}: no closed")
+                continue
+            new_date = pd.Timestamp(closed.index[-1]).normalize()
+            if new_date >= expected:
+                data_map[t] = merged
+                refreshed += 1
+                notes[t] = notes.get(t, "") + f" | {provider_name} OK: ultima Daily {new_date.date().isoformat()}."
+                updated = True
+                break
+            provider_notes.append(f"{provider_name}: {new_date.date().isoformat()}")
+        if not updated:
+            still_stale.append(t)
+            notes[t] = notes.get(t, "") + " | Fallback recenti: " + "; ".join(provider_notes)
+
+    if progress is not None:
+        progress.progress(0.48, text=f"Freschezza Italia completata · {refreshed} aggiornati · {len(still_stale)} ancora arretrati")
+    return data_map, notes, refreshed, still_stale
+
+
+def _market_clock_for_ticker(ticker: str, market: str) -> tuple[str, time]:
+    """Restituisce timezone e chiusura regolare per decidere se la Daily odierna è ancora aperta."""
+    if market == "Italia" or (market == "Misto / ticker Yahoo completi" and ticker.upper().endswith(".MI")):
+        return "Europe/Rome", time(17, 30)
+    return "America/New_York", time(16, 0)
+
+
+def only_closed_daily(data: pd.DataFrame, ticker: str, market: str) -> tuple[pd.DataFrame, bool]:
+    """Esclude soltanto la Daily odierna se la seduta regolare non è ancora conclusa."""
+    if data.empty:
+        return data.copy(), False
+    out = data.copy()
+    tz_name, regular_close = _market_clock_for_ticker(ticker, market)
+    now_local = pd.Timestamp.now(tz=ZoneInfo(tz_name))
+    last_date = pd.Timestamp(out.index[-1]).date()
+    if last_date == now_local.date() and now_local.time().replace(tzinfo=None) < regular_close:
+        out = out.iloc[:-1].copy()
+        return out, True
+    return out, False
+
+
+# =============================================================================
+# BALANCE ENGINE — stesse definizioni del motore Python COT Smart Money
+# lookback richiesto: 400
+# =============================================================================
+def wilder_atr(daily: pd.DataFrame, length: int = 14) -> pd.Series:
+    if daily.empty:
+        return pd.Series(dtype=float)
+    high = daily["high"].astype(float)
+    low = daily["low"].astype(float)
+    close = daily["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = pd.Series(index=tr.index, dtype=float)
+    if len(tr) < length:
+        return atr
+    atr.iloc[length - 1] = float(tr.iloc[:length].mean())
+    for i in range(length, len(tr)):
+        atr.iloc[i] = (float(atr.iloc[i - 1]) * (length - 1) + float(tr.iloc[i])) / length
+    return atr
+
+
+def _future_close_extremes(close: np.ndarray, validation_bars: int) -> tuple[np.ndarray, np.ndarray]:
+    n = len(close)
+    fmin = np.full(n, np.nan, dtype=float)
+    fmax = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        a = i + 1
+        b = min(n, i + validation_bars + 1)
+        if a < b:
+            vals = close[a:b]
+            fmin[i] = float(np.min(vals))
+            fmax[i] = float(np.max(vals))
+    return fmin, fmax
+
+
+def _balance_eval_compatible(
+    daily: pd.DataFrame, center: float, half: float, scan_limit: int, validation_bars: int = 10,
+    future_min: np.ndarray | None = None, future_max: np.ndarray | None = None,
+) -> tuple[int, int, int, int, int, float]:
+    # Stesse definizioni del motore originale. Le finestre future vengono
+    # precalcolate una sola volta per simbolo per velocizzare universi ampi.
+    lows = daily["low"].to_numpy(float)
+    highs = daily["high"].to_numpy(float)
+    closes = daily["close"].to_numpy(float)
+    if future_min is None or future_max is None:
+        future_min, future_max = _future_close_extremes(closes, validation_bars)
+
+    current = len(closes) - 1
+    first_offset = validation_bars + 1
+    last_offset = min(scan_limit - 1, current)
+    if last_offset < first_offset:
+        return 0, 0, 0, 0, 99999, 0.0
+
+    start_pos = current - last_offset
+    end_pos = current - first_offset
+    pos = np.arange(start_pos, end_pos + 1)
+    top, bottom = center + half, center - half
+    overlap = (lows[pos] <= top) & (highs[pos] >= bottom)
+    if not np.any(overlap):
+        return 0, 0, 0, 0, 99999, 0.0
+
+    pp = pos[overlap]
+    is_support = closes[pp] >= center
+    broken_support = future_min[pp] < bottom
+    broken_resistance = future_max[pp] > top
+    valid_support = is_support & (~broken_support)
+    valid_resistance = (~is_support) & (~broken_resistance)
+
+    support_hits = int(np.sum(valid_support))
+    resistance_hits = int(np.sum(valid_resistance))
+    dwell = int(len(pp))
+    hits = support_hits + resistance_hits
+    valid_any = valid_support | valid_resistance
+    nearest_age = int(np.min(current - pp[valid_any])) if np.any(valid_any) else 99999
+
+    hit_score = 1.0 - math.exp(-hits / 18.0)
+    dwell_score = 1.0 - math.exp(-dwell / 45.0)
+    role_mix = min(support_hits, resistance_hits) / max(1.0, float(max(support_hits, resistance_hits)))
+    freshness = 0.0 if nearest_age == 99999 else math.exp(-nearest_age / 200.0)
+    density = min(1.0, hits / max(1.0, float(dwell)))
+    strength = 100.0 * (0.50 * hit_score + 0.15 * dwell_score + 0.12 * role_mix + 0.13 * freshness + 0.10 * density)
+    strength = max(0.0, min(100.0, strength))
+    return support_hits, resistance_hits, hits, dwell, nearest_age, strength
+
+def _balance_eval_independent(
+    daily: pd.DataFrame, atr: pd.Series, center: float, half: float, scan_limit: int,
+    validation_bars: int = 10, cooldown_bars: int = 6, min_reaction_atr: float = 0.20,
+) -> tuple[int, int, int, int, int, float]:
+    top, bottom = center + half, center - half
+    tests = successes = sup_success = res_success = breaks = 0
+    last_accepted: int | None = None
+    current = len(daily) - 1
+    first_offset = validation_bars + 1
+    last_offset = min(scan_limit - 1, current)
+    if last_offset < first_offset:
+        return 0, 0, 0, 0, 0, math.nan
+
+    lows = daily["low"].to_numpy(float)
+    highs = daily["high"].to_numpy(float)
+    closes = daily["close"].to_numpy(float)
+    atr_arr = atr.to_numpy(float)
+
+    for offset in range(first_offset, last_offset + 1):
+        pos = current - offset
+        if pos - 1 < 0:
+            continue
+        overlaps = lows[pos] <= top and highs[pos] >= bottom
+        previous_above = closes[pos - 1] > top
+        previous_below = closes[pos - 1] < bottom
+        independent_entry = overlaps and (previous_above or previous_below)
+        cooldown_ok = last_accepted is None or abs(offset - last_accepted) >= cooldown_bars
+        if not (independent_entry and cooldown_ok):
+            continue
+
+        is_support_test = previous_above
+        broken = False
+        max_away = 0.0
+        atr_at_test = atr_arr[pos] if pos < len(atr_arr) and math.isfinite(atr_arr[pos]) else max(1e-12, abs(center) * 1e-6)
+        for k in range(1, validation_bars + 1):
+            later = pos + k
+            if later <= current:
+                c = closes[later]
+                if is_support_test:
+                    if c < bottom:
+                        broken = True
+                    max_away = max(max_away, highs[later] - center)
+                else:
+                    if c > top:
+                        broken = True
+                    max_away = max(max_away, center - lows[later])
+        reacted = max_away >= atr_at_test * min_reaction_atr
+        success = (not broken) and reacted
+        tests += 1
+        if success:
+            successes += 1
+            if is_support_test:
+                sup_success += 1
+            else:
+                res_success += 1
+        if broken:
+            breaks += 1
+        last_accepted = offset
+
+    reliability = 100.0 * successes / tests if tests else math.nan
+    return tests, successes, sup_success, res_success, breaks, reliability
+
+
+def _select_balance_engine(
+    data: pd.DataFrame,
+    atr: pd.Series,
+    atr_now: float,
+    range_low: float,
+    active_range: float,
+    scan_limit: int,
+    scan_step_pct: float,
+    max_zones: int,
+    zone_half_atr: float,
+    min_spacing_range_pct: float,
+    validation_bars: int,
+    engine: str,
+) -> list[BalanceZone]:
+    """Istanza indipendente del motore Balance: A Structural oppure B Reaction.
+
+    A e B condividono soltanto geometria/range/spacing; candidati, ranking e
+    selezione vengono calcolati separatamente. Cambia soltanto la Validation.
+    """
+    half = max(1e-12, atr_now * float(zone_half_atr))
+    closes_arr = data["close"].to_numpy(float)
+    future_min, future_max = _future_close_extremes(closes_arr, int(validation_bars))
+    candidates: list[tuple[float, float, int, int, int, int, int]] = []
+    steps = int(round(100.0 / float(scan_step_pct)))
+
+    for step_idx in range(steps + 1):
+        pct = min(100.0, step_idx * float(scan_step_pct))
+        center = range_low + active_range * pct / 100.0
+        sup, res, hits, dwell, age, strength = _balance_eval_compatible(
+            data,
+            center,
+            half,
+            scan_limit,
+            validation_bars=int(validation_bars),
+            future_min=future_min,
+            future_max=future_max,
+        )
+        if hits >= 1:
+            candidates.append((center, strength, hits, sup, res, dwell, age))
+
+    spacing = active_range * float(min_spacing_range_pct) / 100.0
+    selected: list[BalanceZone] = []
+    for center, strength, hits, sup, res, dwell, age in sorted(candidates, key=lambda x: x[1], reverse=True):
+        if len(selected) >= int(max_zones):
+            break
+        if any(abs(center - z.center) < spacing for z in selected):
+            continue
+        tests, succ, ind_sup, ind_res, brk, rel = _balance_eval_independent(
+            data,
+            atr,
+            center,
+            half,
+            scan_limit,
+            validation_bars=int(validation_bars),
+        )
+        selected.append(BalanceZone(
+            center=center,
+            half=half,
+            pct_range=100.0 * (center - range_low) / active_range,
+            strength=strength,
+            hits=hits,
+            support_hits=sup,
+            resistance_hits=res,
+            dwell=dwell,
+            last_hit_age=age,
+            independent_tests=tests,
+            independent_successes=succ,
+            independent_support_success=ind_sup,
+            independent_resistance_success=ind_res,
+            independent_breaks=brk,
+            reliability=rel,
+            engine=str(engine),
+        ))
+
+    selected.sort(key=lambda z: z.center)
+    return selected
+
+
+def _reaction_covered_by_structural(reaction: BalanceZone, structural: list[BalanceZone]) -> bool:
+    """Stessa deduplicazione grafica A>B del riferimento Pine."""
+    r_top = reaction.center + reaction.half
+    r_bottom = reaction.center - reaction.half
+    for z in structural:
+        a_top = z.center + z.half
+        a_bottom = z.center - z.half
+        if r_top >= a_bottom and r_bottom <= a_top:
+            return True
+    return False
+
+
+def analyze_balance_zones(
+    daily: pd.DataFrame,
+    lookback: int = LOOKBACK,
+    scan_step_pct: float = 1.0,
+    max_zones: int = 10,
+    zone_half_atr: float = 0.20,
+    min_spacing_range_pct: float = 8.0,
+) -> dict[str, Any]:
+    """Porting del Balance Zones Pro v0.5.3.4: A Structural + B Reaction.
+
+    A usa Validation 10; B è una seconda istanza indipendente con Validation 5.
+    Le Reaction sovrapposte alle Structural vengono deduplicate e prevale A.
+    """
+    unavailable = {"available": False, "zones": [], "structural_zones": [], "reaction_zones": [], "detail": "Dati Daily insufficienti."}
+    if daily.empty or len(daily) < max(60, min(lookback, 120)):
+        return unavailable
+    data = daily.copy().dropna(subset=["high", "low", "close"])
+    if len(data) < 60:
+        return unavailable
+
+    atr = wilder_atr(data, 14)
+    atr_now = float(atr.iloc[-1]) if not atr.empty and pd.notna(atr.iloc[-1]) else math.nan
+    if not math.isfinite(atr_now) or atr_now <= 0:
+        return unavailable
+
+    scan_limit = min(int(lookback), len(data) - 1)
+    window = data.iloc[-min(int(lookback), len(data)):]
+    range_high = float(window["high"].max())
+    range_low = float(window["low"].min())
+    active_range = range_high - range_low
+    if not math.isfinite(active_range) or active_range <= 0:
+        return unavailable
+
+    structural = _select_balance_engine(
+        data, atr, atr_now, range_low, active_range, scan_limit,
+        scan_step_pct, max_zones, zone_half_atr, min_spacing_range_pct,
+        validation_bars=10, engine="A",
+    )
+    reaction_all = _select_balance_engine(
+        data, atr, atr_now, range_low, active_range, scan_limit,
+        scan_step_pct, max_zones, zone_half_atr, min_spacing_range_pct,
+        validation_bars=5, engine="B",
+    )
+    reaction = [z for z in reaction_all if not _reaction_covered_by_structural(z, structural)]
+
+    combined = sorted(structural + reaction, key=lambda z: z.center)
+    if not combined:
+        return {**unavailable, "detail": "Nessuna Balance selezionata."}
+
+    return {
+        "available": True,
+        "zones": combined,
+        "structural_zones": structural,
+        "reaction_zones": reaction,
+        "atr14": atr_now,
+        "range_high": range_high,
+        "range_low": range_low,
+        "detail": (
+            f"{len(structural)} Structural A + {len(reaction)} Reaction B | "
+            f"Lookback {scan_limit} Daily | ATR14 {atr_now:.4f}"
+        ),
+    }
+
+
+# =============================================================================
+# DOMINANZA STORICA S/R — usa SOLO le statistiche già contenute nella Balance
+# =============================================================================
+def balance_zone_historical_dominance(z: BalanceZone) -> int:
+    """Classifica la dominanza storica della Balance, senza usare il prezzo corrente.
+
+    Ordine identico alle evidenze del motore originale:
+    1) successi indipendenti Support/Resistance, con le soglie operative originali;
+    2) fallback sui Support/Resistance Hits compatibili, con la stessa dominanza 1.35;
+    3) se nessun lato domina chiaramente, ROLE_BALANCE = NEUTRA.
+
+    Non usa ref_close, posizione della zona rispetto al prezzo o positional fallback.
+    """
+    enough_independent = (
+        z.independent_tests >= OPERATIONAL_MIN_INDEPENDENT_TESTS
+        and not pd.isna(z.reliability)
+        and float(z.reliability) >= OPERATIONAL_MIN_RELIABILITY
+    )
+    if enough_independent:
+        support_dominant = (
+            z.independent_support_success >= OPERATIONAL_MIN_SUCCESSES
+            and z.independent_support_success >= max(1.0, z.independent_resistance_success * ROLE_DOMINANCE_RATIO)
+        )
+        resistance_dominant = (
+            z.independent_resistance_success >= OPERATIONAL_MIN_SUCCESSES
+            and z.independent_resistance_success >= max(1.0, z.independent_support_success * ROLE_DOMINANCE_RATIO)
+        )
+        if support_dominant:
+            return ROLE_SUPPORT
+        if resistance_dominant:
+            return ROLE_RESISTANCE
+
+    compatible_support_dominant = (
+        z.support_hits >= FALLBACK_MIN_COMPATIBLE_HITS
+        and z.support_hits >= max(1.0, z.resistance_hits * ROLE_DOMINANCE_RATIO)
+    )
+    compatible_resistance_dominant = (
+        z.resistance_hits >= FALLBACK_MIN_COMPATIBLE_HITS
+        and z.resistance_hits >= max(1.0, z.support_hits * ROLE_DOMINANCE_RATIO)
+    )
+    if compatible_support_dominant:
+        return ROLE_SUPPORT
+    if compatible_resistance_dominant:
+        return ROLE_RESISTANCE
+    return ROLE_BALANCE
+
+
+def historical_dominance_info(z: BalanceZone) -> dict[str, Any]:
+    if str(getattr(z, "engine", "A")).upper() == "B":
+        return {"role": ROLE_BALANCE, "label": "REACTION"}
+    role = balance_zone_historical_dominance(z)
+    label = "SUPPORTO" if role == ROLE_SUPPORT else "RESISTENZA" if role == ROLE_RESISTANCE else "NEUTRA"
+    return {"role": int(role), "label": label}
+
+
+# =============================================================================
+# ACTIVE AREA — base G. Balance Active Area Screener V4.4
+# Adattamenti richiesti: SOLO Daily chiuse; requisito ultimo Close dentro opzionale.
+# Quindi "barra 0" = ultima Daily completamente chiusa.
+# =============================================================================
+def candle_touches_zone(row: pd.Series, z: BalanceZone) -> bool:
+    bottom = z.center - z.half
+    top = z.center + z.half
+    return float(row["low"]) <= top and float(row["high"]) >= bottom
+
+
+def price_inside_zone(price: float, z: BalanceZone) -> bool:
+    bottom = z.center - z.half
+    top = z.center + z.half
+    return bottom <= float(price) <= top
+
+
+def _v44_active_metrics(
+    data: pd.DataFrame,
+    z: BalanceZone,
+    require_last_close_inside: bool,
+    interaction_window: int,
+    min_interaction_bars: int,
+) -> dict[str, Any]:
+    """Estensione configurabile della regola V4.4 sulle Daily chiuse."""
+    interaction_window = int(max(2, min(5, interaction_window)))
+    min_interaction_bars = int(max(1, min(5, min_interaction_bars)))
+    if data.empty or len(data) < interaction_window:
+        return {"active": False, "touches": 0, "touch_flags": [False] * interaction_window, "score": math.nan}
+    recent = data.iloc[-interaction_window:]
+    flags = [candle_touches_zone(recent.iloc[i], z) for i in range(interaction_window)]
+    touches = int(sum(flags))
+    last_close = float(data.iloc[-1]["close"])
+    inside = price_inside_zone(last_close, z)
+
+    active = touches >= min_interaction_bars and (inside if require_last_close_inside else True)
+
+    rel_score = 50.0 if pd.isna(z.reliability) else float(z.reliability)
+    touch_score = 100.0 * float(touches) / float(interaction_window)
+    score = 0.45 * touch_score + 0.35 * float(z.strength) + 0.20 * rel_score
+    score = max(0.0, min(100.0, score))
+    return {
+        "active": active,
+        "touches": touches,
+        "touch_flags": flags,
+        "inside": inside,
+        "score": score,
+    }
+
+
+def active_zone_row(
+    label: str,
+    ticker: str,
+    data: pd.DataFrame,
+    balance: dict[str, Any],
+    require_last_close_inside: bool,
+    interaction_window: int,
+    min_interaction_bars: int,
+) -> dict[str, Any] | None:
+    """Restituisce UNA sola Balance per ticker: quella attiva con Score più alto."""
+    if data.empty or len(data) < interaction_window:
+        return None
+
+    last_close = float(data.iloc[-1]["close"])
+    last_date = pd.Timestamp(data.index[-1])
+    best_score = -1.0
+    best_idx = -1
+    best_zone: BalanceZone | None = None
+    best_metrics: dict[str, Any] | None = None
+
+    for idx, z in enumerate(balance.get("zones", []), start=1):
+        m = _v44_active_metrics(data, z, require_last_close_inside, interaction_window, min_interaction_bars)
+        if not m["active"]:
+            continue
+        if float(m["score"]) > best_score:
+            best_score = float(m["score"])
+            best_idx = idx
+            best_zone = z
+            best_metrics = m
+
+    if best_zone is None or best_metrics is None:
+        return None
+
+    flags = best_metrics["touch_flags"]
+    z = best_zone
+    dominance = historical_dominance_info(z)
+    return {
+        "Strumento": label,
+        "Ticker": ticker,
+        "Area": "AREA ATTIVA",
+        "Dominanza S/R": dominance["label"],
+        "Ultimo Close": last_close,
+        "Balance": z.center,
+        "Zona min": z.center - z.half,
+        "Zona max": z.center + z.half,
+        "Tocchi": f"{int(best_metrics['touches'])}/{interaction_window}",
+        "Sequenza tocchi": " ".join("SI" if x else "NO" for x in flags),
+        "Ultimo Close dentro": "SI" if best_metrics.get("inside", False) else "NO",
+        "Score": best_score,
+        "ST": z.strength,
+        "H": z.hits,
+        "T": z.independent_tests,
+        "R %": z.reliability,
+        "Successi indipendenti": z.independent_successes,
+        "Break indipendenti": z.independent_breaks,
+        "Support H": z.support_hits,
+        "Resistance H": z.resistance_hits,
+        "Dwell": z.dwell,
+        "Last Hit Age": z.last_hit_age,
+        "Data ultima Daily chiusa": last_date.strftime("%Y-%m-%d"),
+        "_role_code": dominance["role"],
+        "_zone_index": best_idx,
+    }
+
+
+def all_balance_rows(
+    label: str,
+    ticker: str,
+    data: pd.DataFrame,
+    balance: dict[str, Any],
+    require_last_close_inside: bool,
+    interaction_window: int,
+    min_interaction_bars: int,
+) -> list[dict[str, Any]]:
+    """Diagnostica: tutte le Balance selezionate dal motore, senza etichette inventate."""
+    if data.empty:
+        return []
+    last_close = float(data.iloc[-1]["close"])
+    rows: list[dict[str, Any]] = []
+    for idx, z in enumerate(balance.get("zones", []), start=1):
+        m = _v44_active_metrics(data, z, require_last_close_inside, interaction_window, min_interaction_bars)
+        dominance = historical_dominance_info(z)
+        rows.append({
+            "Strumento": label,
+            "Ticker": ticker,
+            "Zona #": idx,
+            "Area attiva": "SI" if m["active"] else "NO",
+            "Dominanza S/R": dominance["label"],
+            "Ultimo Close": last_close,
+            "Balance": z.center,
+            "Zona min": z.center - z.half,
+            "Zona max": z.center + z.half,
+            "Tocchi": f"{int(m['touches'])}/{interaction_window}",
+            "Sequenza tocchi": " ".join("SI" if x else "NO" for x in m.get("touch_flags", [])),
+            "Ultimo Close dentro": "SI" if m.get("inside", False) else "NO",
+            "Score V4.4": m["score"],
+            "ST": z.strength,
+            "H": z.hits,
+            "T": z.independent_tests,
+            "R %": z.reliability,
+            "Successi indipendenti": z.independent_successes,
+            "Break indipendenti": z.independent_breaks,
+            "Support H": z.support_hits,
+            "Resistance H": z.resistance_hits,
+            "Dwell": z.dwell,
+            "Last Hit Age": z.last_hit_age,
+        })
+    return rows
+
+
+# =============================================================================
+# CHART / EXCEL
+# =============================================================================
+def plot_balance(data: pd.DataFrame, ticker: str, active_center: float, active_bottom: float, active_top: float, dominance_label: str) -> go.Figure:
+    """Grafico AREA ATTIVA + dominanza storica S/R della Balance."""
+    chart = data.tail(220)
+    fig = go.Figure(data=[go.Candlestick(
+        x=chart.index,
+        open=chart["open"], high=chart["high"], low=chart["low"], close=chart["close"],
+        name=ticker,
+    )])
+
+    role = str(dominance_label).upper()
+    if role == "SUPPORTO":
+        line_color = "rgba(0, 150, 90, 1.0)"
+        fill_color = "rgba(0, 150, 90, 0.20)"
+    elif role == "RESISTENZA":
+        line_color = "rgba(235, 105, 25, 1.0)"
+        fill_color = "rgba(235, 105, 25, 0.20)"
+    elif role == "REACTION":
+        line_color = "rgba(135, 135, 135, 1.0)"
+        fill_color = "rgba(135, 135, 135, 0.14)"
+    else:
+        line_color = "rgba(95, 105, 190, 1.0)"
+        fill_color = "rgba(95, 105, 190, 0.18)"
+
+    fig.add_hrect(
+        y0=float(active_bottom), y1=float(active_top),
+        fillcolor=fill_color,
+        line_width=0,
+        annotation_text=f"AREA ATTIVA · {role}",
+        annotation_position="top left",
+    )
+    fig.add_hline(y=float(active_center), line_width=3, line_color=line_color)
+
+    fig.update_layout(
+        title=f"{ticker} · Daily chiusa · AREA ATTIVA · {role}",
+        height=650,
+        xaxis_rangeslider_visible=False,
+        showlegend=False,
+        margin=dict(l=20, r=20, t=65, b=20),
+    )
+    return fig
+
+
+def excel_bytes(active: pd.DataFrame, all_zones: pd.DataFrame, errors: list[dict[str, str]]) -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+        active.to_excel(writer, sheet_name="Aree attive", index=False)
+        all_zones.to_excel(writer, sheet_name="Tutte le Balance", index=False)
+        if errors:
+            pd.DataFrame(errors).to_excel(writer, sheet_name="Errori", index=False)
+
+        wb = writer.book
+        header = wb.add_format({"bold": True, "bg_color": "#1F4E78", "font_color": "#FFFFFF", "border": 1, "align": "center"})
+        n4 = wb.add_format({"num_format": "0.0000"})
+        n2 = wb.add_format({"num_format": "0.00"})
+        active_fmt = wb.add_format({"bg_color": "#FFF2CC", "bold": True})
+
+        for name, df in [("Aree attive", active), ("Tutte le Balance", all_zones)]:
+            ws = writer.sheets[name]
+            ws.freeze_panes(1, 0)
+            if len(df.columns):
+                ws.autofilter(0, 0, max(0, len(df)), len(df.columns) - 1)
+            ws.set_row(0, 24, header)
+            for j, col in enumerate(df.columns):
+                width = min(28, max(11, len(str(col)) + 2))
+                if col in {"Strumento", "Ticker", "Area", "Tocchi"}:
+                    width = max(width, 16)
+                fmt = None
+                if col in {"Ultimo Close", "Balance", "Zona min", "Zona max"}:
+                    fmt = n4
+                elif col in {"ST", "R %", "Score", "Score V4.4"}:
+                    fmt = n2
+                ws.set_column(j, j, width, fmt)
+            if len(df) and "Area attiva" in df.columns:
+                c = df.columns.get_loc("Area attiva")
+                ws.conditional_format(1, c, len(df), c, {"type": "text", "criteria": "containing", "value": "SI", "format": active_fmt})
+    return out.getvalue()
+
+
+def scan_signature(
+    universe: list[tuple[str, str]],
+    market: str,
+    adjusted: bool,
+    require_last_close_inside: bool,
+    interaction_window: int,
+    min_interaction_bars: int,
+) -> str:
+    raw = "|".join([
+        market,
+        str(bool(adjusted)),
+        str(bool(require_last_close_inside)),
+        str(int(interaction_window)),
+        str(int(min_interaction_bars)),
+    ] + [t for _, t in universe])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+# =============================================================================
+# UI
+# =============================================================================
+with st.sidebar:
+    st.header("Impostazioni")
+    st.caption("Build V4.5.1")
+    # Default esplicito Italia; key nuova per non ereditare la vecchia selezione Streamlit.
+    market_choice = st.selectbox(
+        "Mercato lista",
+        ["Automatico", "Italia", "USA", "Misto / ticker Yahoo completi"],
+        index=1,
+        key="market_choice_v451_75",
+        help="Automatico: riconosce i file italiani con ticker .MI e i file USA con ticker standard.",
+    )
+    role_filter = st.selectbox(
+        "Mostra aree",
+        ["Supporto", "Resistenza", "Entrambe"],
+        index=2,
+        help="Solo filtro visivo: non rilancia e non modifica lo screening. Entrambe mostra Structural A e Reaction B; le Reaction B non hanno classificazione storica Supporto/Resistenza.",
+    )
+    adjusted = st.checkbox(
+        "Prezzi Yahoo adjusted",
+        value=False,
+        help="È una scelta della serie dati, non un filtro dello screener. Per confronti con TradingView usa la stessa impostazione di aggiustamento del grafico.",
+    )
+    require_last_close_inside = st.checkbox(
+        "Richiedi ultimo Close Daily dentro la Balance",
+        value=False,
+        help="OFF (default): conta solo i tocchi reali richiesti nella finestra scelta. ON: richiede anche che l'ultimo Close Daily chiuso sia ancora dentro la stessa fascia Balance.",
+    )
+    min_interaction_bars = st.number_input(
+        "Tocchi minimi",
+        min_value=1,
+        max_value=5,
+        value=DEFAULT_MIN_INTERACTION_BARS,
+        step=1,
+        help="Numero minimo di tocchi reali richiesti nella finestra scelta. Default 2 su 3.",
+    )
+    interaction_window = st.number_input(
+        "Finestra candele",
+        min_value=2,
+        max_value=5,
+        value=DEFAULT_INTERACTION_WINDOW,
+        step=1,
+        help="Numero di Daily chiuse più recenti su cui contare i tocchi reali della stessa Balance. Default 3.",
+    )
+    uploaded = st.file_uploader("File ticker .txt", type=["txt", "csv"])
+    use_manual = st.checkbox("Modifica/incolla ticker manualmente", value=False, key="use_manual_v451_75")
+    if use_manual:
+        if market_choice in {"Automatico", "Italia"}:
+            default_text = italy_example()
+        elif market_choice == "USA":
+            default_text = usa_example()
+        else:
+            default_text = "# Ticker oppure Nome;Ticker Yahoo\n"
+        manual_text = st.text_area("Ticker", default_text, height=320, key="ticker_manual_v451_75")
+    else:
+        manual_text = ""
+    run = st.button("🔎 Cerca aree Balance attive", type="primary", use_container_width=True)
+
+source_name = ""
+if uploaded is not None and not use_manual:
+    source_name = getattr(uploaded, "name", "")
+    try:
+        text = uploaded.getvalue().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = uploaded.getvalue().decode("latin-1")
+elif use_manual:
+    text = manual_text
+else:
+    # Nessun file e nessun override manuale: usa direttamente l'universo predefinito.
+    # Automatico parte dalla lista Italia; Italia usa la stessa lista completa.
+    if market_choice in {"Automatico", "Italia"}:
+        text = italy_example()
+    elif market_choice == "USA":
+        text = usa_example()
+    else:
+        text = ""
+
+market = infer_market_from_text(text, source_name) if market_choice == "Automatico" else market_choice
+universe = parse_tickers(text, market)
+current_signature = scan_signature(universe, market, adjusted, require_last_close_inside, int(interaction_window), int(min_interaction_bars))
+
+with st.sidebar:
+    if text.strip():
+        if market_choice == "Automatico":
+            st.caption(f"Mercato rilevato: **{market}**")
+        st.caption(f"Ticker riconosciuti: **{len(universe)}**")
+        if universe:
+            preview = ", ".join(t for _, t in universe[:8])
+            if len(universe) > 8:
+                preview += ", …"
+            st.caption(f"Anteprima: {preview}")
+
+if run:
+    if not universe:
+        st.error("Nessun ticker valido nel file/elenco.")
+        st.stop()
+
+    # Elimina subito il risultato precedente: durante una scansione USA non deve
+    # restare visibile la vecchia tabella italiana.
+    st.session_state.pop("balance_stock_screener_v4_5_1", None)
+
+    labels = {ticker: label for label, ticker in universe}
+    tickers = [ticker for _, ticker in universe]
+    progress = st.progress(0.0, text="Avvio scansione…")
+    data_map, notes = load_universe_data(tickers, adjusted=adjusted, progress=progress)
+    data_map, notes, refreshed_stale = refresh_stale_daily_data(
+        data_map, tickers, adjusted=adjusted, market=market, notes=notes, progress=progress
+    )
+    data_map, notes, refreshed_fallback, still_stale = refresh_stale_italy_from_public_fallbacks(
+        data_map, tickers, adjusted=adjusted, market=market, notes=notes, progress=progress
+    )
+    stale_set = set(still_stale)
+
+    active_rows: list[dict[str, Any]] = []
+    all_rows: list[dict[str, Any]] = []
+    details: dict[str, tuple[pd.DataFrame, dict[str, Any], str]] = {}
+    errors: list[dict[str, str]] = []
+
+    for i, ticker in enumerate(tickers, start=1):
+        progress.progress(0.48 + 0.52 * ((i - 1) / len(tickers)), text=f"Balance {i}/{len(tickers)} · {ticker}")
+        if ticker in stale_set:
+            errors.append({"Ticker": ticker, "Errore": "Daily arretrata: Yahoo e i fallback pubblici non hanno fornito l'ultima seduta chiusa attesa."})
+            continue
+        data = data_map.get(ticker, pd.DataFrame())
+        data, _open_bar_removed = only_closed_daily(data, ticker, market)
+        if data.empty or len(data) < 120:
+            errors.append({"Ticker": ticker, "Errore": notes.get(ticker, "Dati insufficienti")})
+            continue
+        try:
+            balance = analyze_balance_zones(data, lookback=LOOKBACK)
+            if not balance.get("available"):
+                errors.append({"Ticker": ticker, "Errore": str(balance.get("detail", "Balance non disponibili"))})
+                continue
+            row = active_zone_row(labels[ticker], ticker, data, balance, require_last_close_inside, int(interaction_window), int(min_interaction_bars))
+            if row is not None:
+                active_rows.append(row)
+            all_rows.extend(all_balance_rows(labels[ticker], ticker, data, balance, require_last_close_inside, int(interaction_window), int(min_interaction_bars)))
+            details[ticker] = (data, balance, labels[ticker])
+        except Exception as exc:
+            errors.append({"Ticker": ticker, "Errore": f"{type(exc).__name__}: {exc}"})
+
+    progress.progress(1.0, text="Completato")
+    st.session_state["balance_stock_screener_v4_5_1"] = {
+        "signature": current_signature,
+        "active_rows": active_rows,
+        "all_rows": all_rows,
+        "interaction_window": int(interaction_window),
+        "min_interaction_bars": int(min_interaction_bars),
+        "details": details,
+        "errors": errors,
+        "adjusted": bool(adjusted),
+        "require_last_close_inside": bool(require_last_close_inside),
+        "total_tickers": len(tickers),
+        "downloaded_tickers": len(data_map),
+        "refreshed_stale": int(refreshed_stale),
+        "refreshed_fallback": int(refreshed_fallback),
+        "still_stale": list(still_stale),
+    }
+
+payload = st.session_state.get("balance_stock_screener_v4_5_1")
+if payload and payload.get("signature") == current_signature:
+    active_rows = payload["active_rows"]
+    all_rows = payload["all_rows"]
+    details = payload["details"]
+    errors = payload["errors"]
+
+    active = pd.DataFrame(active_rows)
+    all_zones = pd.DataFrame(all_rows)
+
+    if active.empty:
+        active_filtered = active.copy()
+    elif role_filter == "Entrambe":
+        # Nessun filtro: include Structural A e Reaction B.
+        active_filtered = active.copy()
+    else:
+        wanted_role = "SUPPORTO" if role_filter == "Supporto" else "RESISTENZA"
+        active_filtered = active[active["Dominanza S/R"].astype(str).str.upper() == wanted_role].copy()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Titoli con Balance calcolate", len(details))
+    c2.metric("Aree attive · Daily chiuse", len(active))
+    c3.metric("Ticker senza risultato", len(errors))
+
+    total_tickers = int(payload.get("total_tickers", len(details) + len(errors)))
+    downloaded_tickers = int(payload.get("downloaded_tickers", len(details)))
+    refreshed_stale = int(payload.get("refreshed_stale", 0))
+    refreshed_fallback = int(payload.get("refreshed_fallback", 0))
+    still_stale = list(payload.get("still_stale", []))
+    if refreshed_stale > 0:
+        st.caption(f"Freschezza dati: {refreshed_stale} ticker arretrati nel batch sono stati aggiornati con retry individuale Yahoo.")
+    if refreshed_fallback > 0:
+        st.caption(f"Freschezza Italia: {refreshed_fallback} ticker sono stati completati con una sorgente Daily alternativa.")
+    if still_stale:
+        st.warning(f"Dati Daily ancora arretrati per {len(still_stale)} ticker: esclusi dallo screening per evitare segnali su dati vecchi.")
+    if total_tickers >= 100 and downloaded_tickers < total_tickers * 0.80:
+        st.error(
+            f"Scansione incompleta: Yahoo Finance ha restituito dati per {downloaded_tickers}/{total_tickers} ticker. "
+            "I risultati sotto non rappresentano l'intero universo; controlla la sezione Ticker senza risultato e riprova dopo alcuni minuti."
+        )
+
+    st.subheader("Aree Balance attive")
+    if active.empty:
+        if require_last_close_inside:
+            st.info(f"Nessuna AREA ATTIVA: servono almeno {int(min_interaction_bars)} tocchi reali nelle ultime {int(interaction_window)} Daily chiuse e l'ultimo Close deve essere dentro la stessa Balance.")
+        else:
+            st.info(f"Nessuna AREA ATTIVA: servono almeno {int(min_interaction_bars)} tocchi reali nelle ultime {int(interaction_window)} Daily chiuse.")
+        active_view = active.copy()
+    elif active_filtered.empty:
+        st.info(f"Nessuna AREA ATTIVA con dominanza storica {role_filter.upper()} con il filtro visivo corrente.")
+        active_view = active_filtered.copy()
+    else:
+        active_filtered = active_filtered.sort_values(["Score", "ST", "Strumento"], ascending=[False, False, True]).reset_index(drop=True)
+        active_view = active_filtered.copy()
+        visible = [
+            "Strumento", "Ticker", "Data ultima Daily chiusa", "Area", "Dominanza S/R", "Ultimo Close", "Balance", "Zona min", "Zona max",
+            "Tocchi", "Sequenza tocchi", "Score", "ST", "H", "T", "R %",
+        ]
+        st.dataframe(
+            active_view[visible],
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Data ultima Daily chiusa": st.column_config.TextColumn("Ultima Daily"),
+                "Ultimo Close": st.column_config.NumberColumn("Ultimo Close", format="%.4f"),
+                "Balance": st.column_config.NumberColumn("Balance", format="%.4f"),
+                "Zona min": st.column_config.NumberColumn("Zona min", format="%.4f"),
+                "Zona max": st.column_config.NumberColumn("Zona max", format="%.4f"),
+                "Score": st.column_config.NumberColumn("Score", format="%.1f"),
+                "ST": st.column_config.NumberColumn("ST", format="%.1f"),
+                "R %": st.column_config.NumberColumn("R %", format="%.1f"),
+            },
+        )
+
+    active_export = active.drop(columns=["_zone_index", "_role_code", "_select"], errors="ignore") if not active.empty else pd.DataFrame(columns=[
+        "Strumento", "Ticker", "Area", "Dominanza S/R", "Ultimo Close", "Balance", "Zona min", "Zona max",
+        "Tocchi", "Score", "ST", "H", "T", "R %"
+    ])
+    all_export = all_zones.copy()
+    xlsx = excel_bytes(active_export, all_export, errors)
+    st.download_button(
+        "⬇️ Esporta Excel",
+        data=xlsx,
+        file_name="balance_stock_screener_v4_5.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    if not active_view.empty:
+        st.subheader("Verifica grafica")
+        active_view["_select"] = active_view["Ticker"].astype(str) + " | " + active_view["Balance"].map(lambda x: f"{x:.4f}")
+        selected_key = st.selectbox("Area attiva", active_view["_select"].tolist(), key="balance_stock_active_chart_v44")
+        selected_row = active_view[active_view["_select"] == selected_key].iloc[0]
+        ticker = str(selected_row["Ticker"])
+        data, balance, _ = details[ticker]
+        st.plotly_chart(
+            plot_balance(
+                data,
+                ticker,
+                float(selected_row["Balance"]),
+                float(selected_row["Zona min"]),
+                float(selected_row["Zona max"]),
+                str(selected_row["Dominanza S/R"]),
+            ),
+            use_container_width=True,
+        )
+        a, b, c, d, e, f = st.columns(6)
+        a.metric("Dominanza storica S/R", str(selected_row["Dominanza S/R"]))
+        b.metric("Ultima Daily", str(selected_row["Data ultima Daily chiusa"]))
+        c.metric("Ultimo Close", f"{float(selected_row['Ultimo Close']):.4f}")
+        d.metric("Balance", f"{float(selected_row['Balance']):.4f}")
+        e.metric("Tocchi", str(selected_row["Tocchi"]))
+        f.metric("Score V4.4", f"{float(selected_row['Score']):.1f}")
+
+    with st.expander("Tutte le Balance calcolate · diagnostica"):
+        if all_zones.empty:
+            st.info("Nessuna Balance disponibile.")
+        else:
+            st.dataframe(all_zones, hide_index=True, use_container_width=True)
+
+    if errors:
+        with st.expander(f"Ticker senza risultato ({len(errors)})"):
+            st.dataframe(pd.DataFrame(errors), hide_index=True, use_container_width=True)
