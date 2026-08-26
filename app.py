@@ -26,7 +26,7 @@ import yfinance as yf
 st.set_page_config(page_title="G. Balance Stock Screener", page_icon="🎯", layout="wide")
 st.title("🎯 G. Balance Stock Screener")
 
-LOOKBACK = 500
+LOOKBACK = 400
 DEFAULT_INTERACTION_WINDOW = 3
 DEFAULT_MIN_INTERACTION_BARS = 2
 
@@ -63,6 +63,7 @@ class BalanceZone:
     independent_resistance_success: int
     independent_breaks: int
     reliability: float
+    engine: str = "A"
 
 
 # =============================================================================
@@ -732,7 +733,7 @@ def only_closed_daily(data: pd.DataFrame, ticker: str, market: str) -> tuple[pd.
 
 # =============================================================================
 # BALANCE ENGINE — stesse definizioni del motore Python COT Smart Money
-# lookback richiesto: 500
+# lookback richiesto: 400
 # =============================================================================
 def wilder_atr(daily: pd.DataFrame, length: int = 14) -> pd.Series:
     if daily.empty:
@@ -877,15 +878,110 @@ def _balance_eval_independent(
     return tests, successes, sup_success, res_success, breaks, reliability
 
 
+def _select_balance_engine(
+    data: pd.DataFrame,
+    atr: pd.Series,
+    atr_now: float,
+    range_low: float,
+    active_range: float,
+    scan_limit: int,
+    scan_step_pct: float,
+    max_zones: int,
+    zone_half_atr: float,
+    min_spacing_range_pct: float,
+    validation_bars: int,
+    engine: str,
+) -> list[BalanceZone]:
+    """Istanza indipendente del motore Balance: A Structural oppure B Reaction.
+
+    A e B condividono soltanto geometria/range/spacing; candidati, ranking e
+    selezione vengono calcolati separatamente. Cambia soltanto la Validation.
+    """
+    half = max(1e-12, atr_now * float(zone_half_atr))
+    closes_arr = data["close"].to_numpy(float)
+    future_min, future_max = _future_close_extremes(closes_arr, int(validation_bars))
+    candidates: list[tuple[float, float, int, int, int, int, int]] = []
+    steps = int(round(100.0 / float(scan_step_pct)))
+
+    for step_idx in range(steps + 1):
+        pct = min(100.0, step_idx * float(scan_step_pct))
+        center = range_low + active_range * pct / 100.0
+        sup, res, hits, dwell, age, strength = _balance_eval_compatible(
+            data,
+            center,
+            half,
+            scan_limit,
+            validation_bars=int(validation_bars),
+            future_min=future_min,
+            future_max=future_max,
+        )
+        if hits >= 1:
+            candidates.append((center, strength, hits, sup, res, dwell, age))
+
+    spacing = active_range * float(min_spacing_range_pct) / 100.0
+    selected: list[BalanceZone] = []
+    for center, strength, hits, sup, res, dwell, age in sorted(candidates, key=lambda x: x[1], reverse=True):
+        if len(selected) >= int(max_zones):
+            break
+        if any(abs(center - z.center) < spacing for z in selected):
+            continue
+        tests, succ, ind_sup, ind_res, brk, rel = _balance_eval_independent(
+            data,
+            atr,
+            center,
+            half,
+            scan_limit,
+            validation_bars=int(validation_bars),
+        )
+        selected.append(BalanceZone(
+            center=center,
+            half=half,
+            pct_range=100.0 * (center - range_low) / active_range,
+            strength=strength,
+            hits=hits,
+            support_hits=sup,
+            resistance_hits=res,
+            dwell=dwell,
+            last_hit_age=age,
+            independent_tests=tests,
+            independent_successes=succ,
+            independent_support_success=ind_sup,
+            independent_resistance_success=ind_res,
+            independent_breaks=brk,
+            reliability=rel,
+            engine=str(engine),
+        ))
+
+    selected.sort(key=lambda z: z.center)
+    return selected
+
+
+def _reaction_covered_by_structural(reaction: BalanceZone, structural: list[BalanceZone]) -> bool:
+    """Stessa deduplicazione grafica A>B del riferimento Pine."""
+    r_top = reaction.center + reaction.half
+    r_bottom = reaction.center - reaction.half
+    for z in structural:
+        a_top = z.center + z.half
+        a_bottom = z.center - z.half
+        if r_top >= a_bottom and r_bottom <= a_top:
+            return True
+    return False
+
+
 def analyze_balance_zones(
     daily: pd.DataFrame,
     lookback: int = LOOKBACK,
     scan_step_pct: float = 1.0,
-    max_zones: int = 9,
-    zone_half_atr: float = 0.12,
+    max_zones: int = 10,
+    zone_half_atr: float = 0.20,
     min_spacing_range_pct: float = 8.0,
 ) -> dict[str, Any]:
-    unavailable = {"available": False, "zones": [], "detail": "Dati Daily insufficienti."}
+    """Porting del Balance Zones Pro v0.5.3.4: A Structural + B Reaction.
+
+    A usa Validation 10; B è una seconda istanza indipendente con Validation 5.
+    Le Reaction sovrapposte alle Structural vengono deduplicate e prevale A.
+    """
+    unavailable = {"available": False, "zones": [], "structural_zones": [], "reaction_zones": [], "detail": "Dati Daily insufficienti."}
     if daily.empty or len(daily) < max(60, min(lookback, 120)):
         return unavailable
     data = daily.copy().dropna(subset=["high", "low", "close"])
@@ -905,59 +1001,34 @@ def analyze_balance_zones(
     if not math.isfinite(active_range) or active_range <= 0:
         return unavailable
 
-    half = max(1e-12, atr_now * float(zone_half_atr))
-    closes_arr = data["close"].to_numpy(float)
-    future_min, future_max = _future_close_extremes(closes_arr, 10)
-    candidates: list[tuple[float, float, int, int, int, int, int]] = []
-    steps = int(round(100.0 / float(scan_step_pct)))
-    for step_idx in range(steps + 1):
-        pct = min(100.0, step_idx * float(scan_step_pct))
-        center = range_low + active_range * pct / 100.0
-        sup, res, hits, dwell, age, strength = _balance_eval_compatible(
-            data, center, half, scan_limit, future_min=future_min, future_max=future_max
-        )
-        if hits >= 1:
-            candidates.append((center, strength, hits, sup, res, dwell, age))
+    structural = _select_balance_engine(
+        data, atr, atr_now, range_low, active_range, scan_limit,
+        scan_step_pct, max_zones, zone_half_atr, min_spacing_range_pct,
+        validation_bars=10, engine="A",
+    )
+    reaction_all = _select_balance_engine(
+        data, atr, atr_now, range_low, active_range, scan_limit,
+        scan_step_pct, max_zones, zone_half_atr, min_spacing_range_pct,
+        validation_bars=5, engine="B",
+    )
+    reaction = [z for z in reaction_all if not _reaction_covered_by_structural(z, structural)]
 
-    if not candidates:
-        return {**unavailable, "detail": "Nessuna Balance qualificata nel lookback corrente."}
-
-    spacing = active_range * float(min_spacing_range_pct) / 100.0
-    selected: list[BalanceZone] = []
-    for center, strength, hits, sup, res, dwell, age in sorted(candidates, key=lambda x: x[1], reverse=True):
-        if len(selected) >= int(max_zones):
-            break
-        if any(abs(center - z.center) < spacing for z in selected):
-            continue
-        tests, succ, ind_sup, ind_res, brk, rel = _balance_eval_independent(data, atr, center, half, scan_limit)
-        selected.append(BalanceZone(
-            center=center,
-            half=half,
-            pct_range=100.0 * (center - range_low) / active_range,
-            strength=strength,
-            hits=hits,
-            support_hits=sup,
-            resistance_hits=res,
-            dwell=dwell,
-            last_hit_age=age,
-            independent_tests=tests,
-            independent_successes=succ,
-            independent_support_success=ind_sup,
-            independent_resistance_success=ind_res,
-            independent_breaks=brk,
-            reliability=rel,
-        ))
-    selected.sort(key=lambda z: z.center)
-    if not selected:
+    combined = sorted(structural + reaction, key=lambda z: z.center)
+    if not combined:
         return {**unavailable, "detail": "Nessuna Balance selezionata."}
 
     return {
         "available": True,
-        "zones": selected,
+        "zones": combined,
+        "structural_zones": structural,
+        "reaction_zones": reaction,
         "atr14": atr_now,
         "range_high": range_high,
         "range_low": range_low,
-        "detail": f"{len(selected)} Balance selezionate | Lookback {scan_limit} Daily | ATR14 {atr_now:.4f}",
+        "detail": (
+            f"{len(structural)} Structural A + {len(reaction)} Reaction B | "
+            f"Lookback {scan_limit} Daily | ATR14 {atr_now:.4f}"
+        ),
     }
 
 
@@ -1009,6 +1080,8 @@ def balance_zone_historical_dominance(z: BalanceZone) -> int:
 
 
 def historical_dominance_info(z: BalanceZone) -> dict[str, Any]:
+    if str(getattr(z, "engine", "A")).upper() == "B":
+        return {"role": ROLE_BALANCE, "label": "REACTION"}
     role = balance_zone_historical_dominance(z)
     label = "SUPPORTO" if role == ROLE_SUPPORT else "RESISTENZA" if role == ROLE_RESISTANCE else "NEUTRA"
     return {"role": int(role), "label": label}
@@ -1193,8 +1266,10 @@ def plot_balance(data: pd.DataFrame, ticker: str, active_center: float, active_b
     elif role == "RESISTENZA":
         line_color = "rgba(235, 105, 25, 1.0)"
         fill_color = "rgba(235, 105, 25, 0.20)"
+    elif role == "REACTION":
+        line_color = "rgba(135, 135, 135, 1.0)"
+        fill_color = "rgba(135, 135, 135, 0.14)"
     else:
-        # Stesso colore Balance neutrale del Balance Zones Pro v0.5.1.8.
         line_color = "rgba(95, 105, 190, 1.0)"
         fill_color = "rgba(95, 105, 190, 0.18)"
 
@@ -1276,7 +1351,7 @@ def scan_signature(
 # =============================================================================
 with st.sidebar:
     st.header("Impostazioni")
-    st.caption("Build V4.4")
+    st.caption("Build V4.5")
     market_choice = st.selectbox(
         "Mercato lista",
         ["Automatico", "Italia", "USA", "Misto / ticker Yahoo completi"],
@@ -1286,8 +1361,8 @@ with st.sidebar:
     role_filter = st.selectbox(
         "Mostra aree",
         ["Supporto", "Resistenza", "Entrambe"],
-        index=0,
-        help="Solo filtro visivo: non rilancia e non modifica lo screening. SUPPORTO/RESISTENZA sono calcolati con la dominanza storica S/R già contenuta nelle statistiche della Balance. È solo un filtro visivo.",
+        index=2,
+        help="Solo filtro visivo: non rilancia e non modifica lo screening. Entrambe mostra Structural A e Reaction B; le Reaction B non hanno classificazione storica Supporto/Resistenza.",
     )
     adjusted = st.checkbox(
         "Prezzi Yahoo adjusted",
@@ -1361,7 +1436,7 @@ if run:
 
     # Elimina subito il risultato precedente: durante una scansione USA non deve
     # restare visibile la vecchia tabella italiana.
-    st.session_state.pop("balance_stock_screener_v4_4", None)
+    st.session_state.pop("balance_stock_screener_v4_5", None)
 
     labels = {ticker: label for label, ticker in universe}
     tickers = [ticker for _, ticker in universe]
@@ -1404,7 +1479,7 @@ if run:
             errors.append({"Ticker": ticker, "Errore": f"{type(exc).__name__}: {exc}"})
 
     progress.progress(1.0, text="Completato")
-    st.session_state["balance_stock_screener_v4_4"] = {
+    st.session_state["balance_stock_screener_v4_5"] = {
         "signature": current_signature,
         "active_rows": active_rows,
         "all_rows": all_rows,
@@ -1421,7 +1496,7 @@ if run:
         "still_stale": list(still_stale),
     }
 
-payload = st.session_state.get("balance_stock_screener_v4_4")
+payload = st.session_state.get("balance_stock_screener_v4_5")
 if payload and payload.get("signature") == current_signature:
     active_rows = payload["active_rows"]
     all_rows = payload["all_rows"]
@@ -1434,9 +1509,8 @@ if payload and payload.get("signature") == current_signature:
     if active.empty:
         active_filtered = active.copy()
     elif role_filter == "Entrambe":
-        # SOLO FILTRO VISIVO: mostra supporti + resistenze già classificati per dominanza storica.
-        # Le eventuali zone NEUTRE restano fuori perché non hanno una dominanza storica S/R chiara.
-        active_filtered = active[active["Dominanza S/R"].astype(str).str.upper().isin(["SUPPORTO", "RESISTENZA"])].copy()
+        # Nessun filtro: include Structural A e Reaction B.
+        active_filtered = active.copy()
     else:
         wanted_role = "SUPPORTO" if role_filter == "Supporto" else "RESISTENZA"
         active_filtered = active[active["Dominanza S/R"].astype(str).str.upper() == wanted_role].copy()
@@ -1505,7 +1579,7 @@ if payload and payload.get("signature") == current_signature:
     st.download_button(
         "⬇️ Esporta Excel",
         data=xlsx,
-        file_name="balance_stock_screener_v4_4.xlsx",
+        file_name="balance_stock_screener_v4_5.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
